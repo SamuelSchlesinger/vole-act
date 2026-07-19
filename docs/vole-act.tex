@@ -405,18 +405,25 @@ sampled $\Spre(\mathsf{sk}, y)$; this mirrors the protocol, where the
 issuer inverts only targets accompanied by a verified proof of opening
 knowledge, and \emph{resamples} on repeated requests (only exact spend
 retransmissions are answered from a cache, which the game models as no
-query at all). Every oracle call counts against $q$, so repeated calls on
-one target consume budget and yield fresh preimages. After $q$ oracle
-calls the adversary must output $q+1$ triples $(y_j, w_j, \sigma_j)$ with
-the $y_j$ pairwise distinct admissible targets, $w_j$ valid openings, and
-$P^\ast(\sigma_j) = y_j$. The assumption is that every efficient adversary
-succeeds with probability negligible in $\lambda$ (as a function of $q$
-and $Q_H$).
+query at all; preimages the issuer samples but discards after losing an
+insertion race never leave the issuer and are not oracle replies). Let
+$Q_S$ bound the total number of oracle calls and let $d \le Q_S$ be the
+number of \emph{distinct} targets queried --- repeated calls on one target
+consume $Q_S$ budget and yield fresh independent preimages, but do not
+increase $d$. The adversary must output $d+1$ triples
+$(y_j, w_j, \sigma_j)$ with the $y_j$ pairwise distinct admissible
+targets, $w_j$ valid openings, and $P^\ast(\sigma_j) = y_j$. The
+assumption is that every efficient adversary succeeds with probability
+negligible in $\lambda$ (as a function of $Q_S$ and $Q_H$). Counting
+distinct targets is essential: charging every call against the success
+threshold would let $r$ resamplings of one target excuse a single forged
+new target, which already violates fiscal soundness.
 
 This is stronger and less studied than MAYO's signature unforgeability ---
 the issuer here \emph{is} a preimage oracle. PoMFRIT~\cite{PoMFRIT}
-formalizes an $(n,q)$ variant with $n$ \emph{random} targets and at most
-$q$ inversions, likewise charging every inversion call; bridging that game
+formalizes an $(n,q)$ variant with $n$ \emph{random} targets, at most $q$
+inversion calls, and $q+1$ distinct target indices for success; bridging
+that game
 to the adaptive, opening-accompanied, two-language version above (and
 stating a QROM variant with quantum XOF access) is part of the outstanding
 analysis, not a citation we inherit.
@@ -474,7 +481,11 @@ P^\ast(\sigma) \;=\; \Def\bigl(\ctx, \Cred(\kappa,b,\rho), t\bigr)
 \;=\; \shake\bigl(\text{``deferred''} \,\|\, \ctx \,\|\,
 \mathsf{pack16}(\Cred) \,\|\, \enc(t)\bigr)[0:4m],
 \]
-and effective balance $b + t$ (exact, non-wrapping). The nested hash gives a
+and effective balance $b + t$ (exact, non-wrapping). (The formal tuples
+elide fixed metadata the implementation stores and
+$\mathsf{VerifyToken}$ checks: the derived context, the credential-kind
+tag, and the direct format's structurally zero top-up.) The nested hash
+gives a
 simple, domain-separated binding of both the base commitment and the return:
 changing $t$ requires a fresh preimage or a target collision, and no
 algebraic combiner (such as $\Cred + \iota(t)$) has to be analyzed for
@@ -503,11 +514,16 @@ statement (all public values, tags, and $\ctx$) bound into Fiat--Shamir.
 \small
 \begin{itemize}
   \item $\mathsf{Setup}(1^\lambda, \mathsf{app})$: run MAYO trapdoor
-  generation for the chosen parameter set; expand the whipped forms; set
-  $\ctx \gets \shake(\text{``context''} \,\|\, \mathsf{frame}(\mathsf{app})
-  \,\|\, H(\text{expanded } P^\ast) \,\|\, \text{parameter and profile
-  identifiers} \,\|\, \text{balance width})[0{:}256]$. Output
-  $(\mathsf{sk}, \mathsf{pk}, \ctx)$.
+  generation for the chosen parameter set; expand the whipped forms; let
+  $h_{\mathsf{pk}}$ be the domain-separated $\shake$ hash of the canonical
+  row-major encoding of the expanded whipped forms of $P^\ast$; set
+  \begin{align*}
+  \ctx \gets \shake(&\text{``context''} \,\|\, \mathsf{frame}(\mathsf{app})
+  \,\|\, h_{\mathsf{pk}}\\
+  &\|\, \text{parameter and profile identifiers}
+  \,\|\, \text{balance width})[0{:}256].
+  \end{align*}
+  Output $(\mathsf{sk}, \mathsf{pk}, \ctx)$.
   \item $\mathsf{Issue}$, client with $(\mathsf{pk}, b)$: sample
   $\kappa, \rho \gets \{0,1\}^{256}$; compute $\Cred$ from the credential
   stream; send $(b, \Cred, \pi)$ where $\pi \gets \Pi.\mathsf{Prove}$ for
@@ -523,16 +539,20 @@ statement (all public values, tags, and $\ctx$) bound into Fiat--Shamir.
   with the same request digest, return the stored response; on a digest
   conflict, reject. Otherwise verify $\pi$, sample
   $\sigma' \gets \Spre(\mathsf{sk}, \Cred')$, construct the candidate
-  record $(\Null, \text{request digest}, \sigma')$, \emph{atomically}
-  insert it, and return whichever record won the insertion race. Client:
+  record $(\Null, \text{request digest}, \sigma')$, and \emph{atomically}
+  insert it. If another record won the insertion race, compare digests:
+  replay the winner if its digest matches this request, otherwise reject.
+  Client:
   accept the direct token $(\sigma', \kappa', b', \rho')$ iff
   $P^\ast(\sigma') = \Cred'$.
   \item $\mathsf{SpendDeferred}$: as $\mathsf{Spend}$ with settlement tag
   ``deferred-return-spend'', except the issuer, after verifying $\pi$,
   first picks $t' \le s$, then samples
   $\sigma' \gets \Spre(\mathsf{sk}, \Def(\ctx, \Cred', t'))$, constructs
-  the candidate record containing $(t', \sigma')$, atomically inserts, and
-  returns the durable winner. Client: accept the deferred-return token
+  the candidate record containing $(t', \sigma')$, and atomically inserts
+  it; if another record won the race, it replays the winner --- including
+  the winner's original $t'$ --- when digests match and rejects otherwise.
+  Client: accept the deferred-return token
   $(\sigma', \kappa', b', \rho', t')$ iff $t' \le s$ and
   $P^\ast(\sigma') = \Def(\ctx, \Cred', t')$.
   \item $\mathsf{VerifyToken}(\mathsf{pk}, T)$: check that $T$'s stored
@@ -693,8 +713,10 @@ composition loss are unquantified):
   digest, hence a larger $m$.
 \end{itemize}
 Honest double spends are prevented operationally: a repeated credential
-reveals the same deterministic nullifier and is refused by the nullifier
-store, whose atomic retry semantics also make honest retransmission safe.
+reveals the same deterministic nullifier, whose conflicting reuse the
+store refuses while exact retransmissions are replayed from the stored
+record --- the atomic retry semantics that also make honest
+retransmission safe.
 
 \begin{claim}[Spend anonymity, conditional]
 \label{claim:anon}
