@@ -1,0 +1,621 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1.1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{microtype}
+\usepackage{xcolor}
+\definecolor{linkblue}{RGB}{25,60,120}
+\usepackage[colorlinks=true,linkcolor=linkblue,citecolor=linkblue,urlcolor=linkblue]{hyperref}
+
+\newtheorem{definition}{Definition}
+\newtheorem{remark}{Remark}
+
+\newcommand{\F}{\mathbb{F}}
+\newcommand{\Ftwo}{\F_2}
+\newcommand{\Fsixteen}{\F_{16}}
+\newcommand{\Ftag}{\F_{2^{128}}}
+\newcommand{\shake}{\mathsf{SHAKE256}}
+\newcommand{\ctx}{\mathsf{ctx}}
+\newcommand{\Spre}{\mathsf{SPre}}
+\newcommand{\enc}{\mathsf{enc}_{64}}
+\newcommand{\Cred}{\mathsf{C}}
+\newcommand{\Null}{\mathsf{N}}
+\newcommand{\Def}{\mathsf{D}}
+
+\title{VOLE-ACT: Post-Quantum Anonymous Credit Tokens\\
+from VOLE-in-the-Head and MAYO}
+\author{Samuel Schlesinger}
+\date{July 2026\\[0.5em]\normalsize Research prototype documentation --- not yet proven or independently audited}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Anonymous credit tokens let an issuer grant a client a hidden, spendable
+balance: the client can later redeem credits unlinkably, each redemption
+consumes a one-time nullifier and returns a fresh token on the remaining
+balance. Classical constructions rest on discrete-logarithm-style algebra ---
+blind or randomizable signatures, algebraic MACs, Sigma protocols --- none of
+which survives a quantum adversary, and the post-quantum blind-signature
+literature has proved fragile. We describe VOLE-ACT, a post-quantum
+instantiation of the Katz--Schlesinger anonymous-credit design whose entire
+symmetric layer is Keccak and whose only algebraic assumption is the
+multivariate-quadratic (whipped MAYO) trapdoor. The central idea is to
+\emph{avoid blindness entirely}: the issuer signs a revealed SHAKE256
+commitment digest whose preimage stays hidden, and possession of the signature
+is later proven in zero knowledge inside a VOLE-in-the-Head proof system that
+is native to exactly the two ingredients we must prove --- Keccak (a Boolean
+circuit) and MAYO verification (a quadratic system over
+$\Fsixteen \subseteq \Ftag$). We explain the credential design, the proof
+circuit --- including a degree-16 Keccak checkpointing technique that commits
+the permutation state only every four rounds --- the quadratic-system
+constraint used for MQ verification, the exact 64-bit balance arithmetic, and
+the deferred-return settlement extension. We report implementation
+performance: on one Apple M4 Pro core-complex a spend proof takes
+$\approx$21--23\,ms to produce and $\approx$7.5--9\,ms to verify-and-sign,
+with 53\,KiB proofs in the compact profile; tokens themselves are 283 bytes.
+\end{abstract}
+
+\section{Introduction}
+
+An anonymous credit token system has one issuer and many clients. The issuer
+grants a client a public number of credits; the client can later spend part of
+that balance without revealing which issuance --- or which earlier spend ---
+produced the token being presented. Each accepted spend consumes a one-time
+nullifier (preventing double spending) and returns a fresh token carrying the
+remaining balance. The functionality generalizes anonymous tokens in the
+Privacy Pass style~\cite{PrivacyPass} from unit tokens to stateful balances,
+and specializes keyed-verification anonymous
+credentials~\cite{CMZ14} to a single numeric attribute with exact arithmetic.
+
+Classically this is well-trodden ground: blind signatures~\cite{Chaum82},
+CL~signatures~\cite{CL01}, algebraic MACs~\cite{CMZ14} and their pairing-based
+relatives give compact, efficient constructions. All of them lean on the
+algebraic structure of discrete-log or pairing groups, both for the signature
+and for the efficient zero-knowledge presentation protocol. Neither survives
+a quantum adversary. Worse, the natural repair --- a post-quantum \emph{blind}
+signature --- has a discouraging record: lattice-based blind signatures have
+been repeatedly broken or weakened, and no candidate has earned the kind of
+confidence one wants under real value.
+
+\paragraph{The core idea: sign a digest, hide the preimage.}
+VOLE-ACT, following the Katz--Schlesinger design~\cite{KS}, sidesteps
+blindness. A credential is a short XOF stream
+\[
+X \;=\; \shake(\text{domain} \,\|\, \ctx \,\|\, k \,\|\, \enc(b) \,\|\, \rho),
+\]
+over a client-chosen 256-bit nullifier key $k$, public balance $b$, and
+256-bit hiding nonce $\rho$. The first $4m$ bits of $X$ form the
+\emph{commitment digest} $\Cred \in \Fsixteen^m$; the next 256 bits form the
+\emph{nullifier} $\Null$. At issuance the client \emph{reveals} $\Cred$ and
+proves in zero knowledge that it is well-formed for the public balance $b$;
+the issuer then computes an ordinary MAYO preimage
+$\sigma \gets \Spre(\mathsf{sk}, \Cred)$ and returns it. Nothing is blind:
+the issuer sees exactly the digest it signs. Unlinkability comes later --- at
+spend time the client proves \emph{in zero knowledge} that it knows
+$(\sigma, k, b, \rho)$ with $P(\sigma) = \Cred(k,b,\rho)$, revealing only the
+nullifier $\Null$, the public spend amount, and a fresh commitment digest
+$\Cred'$ for the successor token. The signature and the signed digest are
+never shown again, so there is nothing to link. The unrevealed suffix of $X$
+is treated as pseudorandom given its prefix, which is what makes the
+nullifier unlinkable to the issuance in which the issuer saw $\Cred$.
+
+This pattern reduces the required primitives to (i) a post-quantum signature
+whose \emph{verification} is cheap inside a proof system, and (ii) a
+post-quantum zero-knowledge proof system that is efficient on
+\emph{hash-heavy Boolean} statements. The pairing of MAYO with
+VOLE-in-the-Head is unusually harmonious on both counts:
+
+\begin{itemize}
+  \item \textbf{MAYO}~\cite{Beullens21,MAYOspec} verification evaluates a
+  public multivariate quadratic map over $\Fsixteen$. Since
+  $\Fsixteen$ embeds as a subfield of the proof system's tag field
+  $\Ftag$, the whole verification equation becomes a single batched
+  \emph{quadratic system} constraint in the proof --- no bit decomposition,
+  no modular arithmetic emulation.
+  \item \textbf{VOLE-in-the-Head}~\cite{VOLEitH,FAEST} proof systems commit
+  witness \emph{bits} and prove Boolean and low-degree relations at
+  QuickSilver~\cite{QuickSilver,Wolverine} cost: linear gates are free, and a
+  degree-$d$ relation costs one $\Ftag$ element of proof. Keccak --- the only
+  hash we use anywhere --- is the friendliest possible circuit for such a
+  system: its round function is degree 2.
+\end{itemize}
+
+The result is a scheme whose zero-knowledge layer is hash-based (its security
+reduces to Keccak's soundness as a correlation-robust hash / random oracle),
+whose unforgeability is exactly MAYO's, and whose anonymity survives even if
+MAYO falls. There are no lattices, no pairings, and no bespoke assumptions.
+
+\paragraph{Contributions of the implementation described here.}
+(1)~A concrete credential and settlement design: one XOF stream yielding both
+commitment and nullifier; a typed two-format token state machine; and a
+\emph{deferred-return} extension in which the issuer selects a bounded return
+$t' \le s$ only \emph{after} verifying the spend proof, wrapped in a nested
+hash so the returned amount cannot be reopened or transplanted.
+(2)~A proof circuit for SHAKE256 with \emph{degree-16 checkpointing}: the
+permutation state is committed only every four rounds, quartering the
+dominant witness cost by exploiting the proof system's polynomial constraint
+degree.
+(3)~A batched quadratic-system constraint that expresses the whipped MAYO
+verification equation with shared product terms across all $m$ equations,
+folded by verifier randomness.
+(4)~An engineering result: the full protocol runs at interactive latencies on
+commodity hardware (Table~\ref{tab:perf}) with 283-byte tokens and 53\,KiB
+compact spend proofs, using hardware Keccak, word-level bit-matrix
+transposition, and parallel GGM tree expansion.
+
+\section{Preliminaries}
+
+\subsection{Notation}
+$\lambda = 128$ throughout. $\Ftwo$, $\Fsixteen = \Ftwo[x]/(x^4{+}x{+}1)$ and
+$\Ftag = \Ftwo[x]/(x^{128}{+}x^7{+}x^2{+}x{+}1)$ are the Boolean, MAYO, and
+tag fields; $\iota : \Fsixteen \hookrightarrow \Ftag$ is the canonical field
+embedding (the same reduction polynomial family used by
+FAEST~\cite{FAEST}). $\shake$ is used for every PRG, commitment, and
+Fiat--Shamir hash, always with prefix-free domain separation and
+length-framed inputs~\cite{FIPS202}. $\enc(\cdot)$ is 64-bit little-endian
+encoding.
+
+\subsection{VOLE-based zero knowledge and VOLE-in-the-Head}
+\label{sec:voleith}
+
+In VOLE-based ZK~\cite{Wolverine,QuickSilver}, the prover holds, for each
+witness bit $u_t \in \{0,1\}$, a \emph{tag} $V_t \in \Ftag$, and the verifier
+holds a global secret $\Delta \in \Ftag$ and per-coordinate \emph{keys}
+\[
+K_t \;=\; V_t + u_t \cdot \Delta ,
+\]
+a vector oblivious linear evaluation (VOLE) correlation. Wires are affine
+combinations of committed bits and are linearly homomorphic for free. A
+multiplication (degree-2) constraint $a \cdot b = c$ is checked
+QuickSilver-style: the verifier forms $B = K_a K_b + \Delta K_c$, which the
+prover can match with a degree-1 polynomial in $\Delta$ exactly when the
+constraint holds; a random linear combination with challenge weights
+$\chi_i$ batches all constraints into one polynomial identity checked at
+$\Delta$. The generalization to degree-$d$ polynomial constraints costs
+$d$ published coefficients and $d-1$ random VOLE masks in total for the whole
+batch.
+
+VOLE-in-the-Head~\cite{VOLEitH} makes this \emph{publicly verifiable and
+non-interactive}: the prover generates the VOLE correlation itself from
+$\tau$ GGM~\cite{GGM86} seed trees of depth $k$ (with $\tau \cdot k =
+\lambda$), commits to all $2^k$ leaves of each tree with an all-but-one
+vector commitment, and the Fiat--Shamir challenge $\Delta$ selects, per tree,
+one leaf that stays hidden; the remaining leaves are opened and the verifier
+recomputes its keys. Soundness comes from the hidden leaf; zero knowledge
+from the fact that the opened leaves are exactly what the verifier can
+recompute anyway. Our instantiation follows the hardening of
+FAEST~\cite{FAEST} and ``One Tree to Rule Them All''~\cite{OneTree}: every
+PRG and commitment call binds a per-proof $2\lambda$-bit salt, a per-tree
+derived salt, and the exact tree position, eliminating multi-target and
+multi-instance batch attacks on the 128-bit seeds; small-field consistency
+across the $\tau$ trees uses public corrections re-based onto one shared
+$u$-vector, in the style of SoftSpokenOT~\cite{SoftSpoken}.
+
+Three parameter profiles trade proof size against tree-expansion work:
+\emph{compact} $(\tau,k) = (16,8)$, \emph{balanced} $(32,4)$, and
+\emph{low-latency} $(64,2)$. Each opened proof reveals $\tau$ tree openings
+of $k$ sibling seeds, so proofs shrink as $k$ grows while the prover expands
+$\tau \cdot 2^k$ leaves.
+
+\paragraph{The consistency check must be a matrix hash.}
+Because each tree contributes only $k$ bits of $\Delta$, a cheating prover
+who mangles one tree's correction data is caught by a per-tree check only
+with probability $1 - 2^{-k}$ --- as low as $3/4$ for $k=2$. The
+implementation therefore applies a $128$-row \emph{column-wise linear
+universal hash} to the entire tag matrix (two independent polynomial
+evaluations combined with random weights, plus a one-time-pad block), so that
+any inconsistency survives into the check equation with probability
+$1 - 2^{-\lambda}$ regardless of the chunk structure. A scalar hash in place
+of the matrix hash is a real soundness bug we caught during development; we
+flag it because the failure is silent and parameter-dependent.
+
+\subsection{MAYO}
+\label{sec:mayo}
+
+MAYO~\cite{Beullens21,MAYOspec} is an oil-and-vinegar~\cite{UOV} trapdoor
+map: a public quadratic map $P^\ast : \Fsixteen^{n} \to \Fsixteen^{m}$
+vanishing on a secret $o$-dimensional oil space, with $o < m$ deliberately
+too small for direct Kipnis--Shamir-style attacks; the ``whipping''
+construction evaluates $k_w$ correlated copies to stretch the oil space, so
+the effective public map is
+$P : \Fsixteen^{k_w n} \to \Fsixteen^{m}$. The trapdoor samples preimages
+$\sigma$ with $P(\sigma) = y$ for arbitrary targets $y$; this
+\emph{hash-then-invert} usage (rather than MAYO's message-signing API) is
+exactly what the scheme needs. We use the round-2 parameter set
+MAYO$_2$: $(n,m,o,k_w) = (81,64,17,4)$, so $\sigma \in \Fsixteen^{324}$
+(162 bytes) and targets are $m = 64$ nibbles (32 bytes). We note the risk
+posture explicitly: multivariate trapdoors have a difficult history ---
+Rainbow fell to a practical attack in 2022~\cite{Beullens22} --- and MAYO's
+whipping is comparatively young. The design compartmentalizes this risk:
+a MAYO break forges credentials but does \emph{not} deanonymize past
+transactions, whose privacy rests only on the hash-based layer.
+
+For the proof circuit, the whipped map is expanded once per public key into
+$m$ upper-triangular forms $G_a \in \Fsixteen^{k_w n \times k_w n}$ with
+$P(\sigma)_a = \sigma^{\!\top} G_a\, \sigma$; the circuit then proves
+$m$ quadratic equations over the \emph{same} $\binom{k_w n + 1}{2}$ product
+terms (Section~\ref{sec:quadsys}).
+
+\section{The scheme}
+\label{sec:scheme}
+
+\subsection{Credentials and nullifiers from one XOF stream}
+
+Fix a 256-bit context $\ctx$ binding the issuer key (by hash of the expanded
+public map), application domain, parameter set, VOLE profile, and protocol
+version. The client samples $k, \rho \gets \{0,1\}^{256}$ and, for base
+balance $b \in \{0,\dots,2^{64}{-}1\}$, derives the stream
+\[
+X = \shake(\text{``credential''} \,\|\, \ctx \,\|\, k \,\|\, \enc(b) \,\|\, \rho),
+\qquad
+\Cred = X[0 : 4m], \quad \Null = X[4m : 4m{+}256].
+\]
+Both values come from a \emph{single} sponge evaluation --- the message fits
+one Keccak rate block --- so proving both costs one in-circuit permutation.
+The commitment prefix $\Cred$ is revealed to the issuer exactly once (at
+signing time); the nullifier suffix $\Null$ is revealed exactly once (at
+spending time). Under the standard modeling of the sponge, the suffix is
+pseudorandom given the prefix, which is what divorces the spend from the
+issuance.
+
+\subsection{Two token formats and the settlement state machine}
+
+A \emph{direct} token is $(\sigma, k, b, \rho)$ with
+$P(\sigma) = \Cred(k,b,\rho)$ and effective balance $b$. A
+\emph{deferred-return} token additionally carries an issuer-chosen return
+$t$, with
+\[
+P(\sigma) \;=\; \Def\bigl(\ctx, \Cred(k,b,\rho), t\bigr)
+\;=\; \shake\bigl(\text{``deferred''} \,\|\, \ctx \,\|\,
+\mathsf{pack16}(\Cred) \,\|\, \enc(t)\bigr)[0:4m],
+\]
+and effective balance $b + t$ (exact, non-wrapping). The nested hash is
+essential: signing any \emph{algebraically adjustable} target (say
+$\Cred + \iota(t)$) would let a holder reopen one signature to a different
+return. Here changing $t$ requires a fresh preimage or a target collision.
+
+Spends are typed. An ordinary \texttt{spend} consumes either format and
+always outputs a direct token; \texttt{spend-with-deferred-return} consumes
+either format and outputs a deferred-return token. The client commits to a
+fresh $(k', \rho', b')$ \emph{before} the issuer chooses $t' \le s$, which is
+precisely the case that cannot be expressed as a smaller net spend --- if the
+return were known in advance, the client would simply spend less. All four
+transitions carry distinct domain-separation tags end-to-end, so mode
+confusion at the byte level cannot create an untyped path.
+
+\subsection{The spend relation}
+
+To spend public amount $s$ from a direct token, the client reveals
+$(s, \Null, \Cred')$ and proves knowledge of
+$(\sigma, k, b, \rho, k', b', \rho')$ such that
+\[
+P(\sigma) = \Cred(k,b,\rho), \qquad
+\Null = \Null(k,b,\rho), \qquad
+b' + s = b, \qquad
+\Cred' = \Cred(k',b',\rho').
+\]
+For a deferred-return input the first equation becomes
+$P(\sigma) = \Def(\ctx, \Cred(k,b,\rho), t)$ with hidden $t$, together with
+the exact fold $b + t = e$ and $b' + s = e$. The balance equations are
+\emph{exact 64-bit unsigned additions with zero final carry}, proven over
+committed carry bits --- there is no modular wraparound to exploit, and
+overspending is exactly the statement ``the final carry is 1,'' which the
+circuit rejects. The issuer verifies, signs the fresh digest
+($\sigma' \gets \Spre(\mathsf{sk}, \Cred')$, or the nested target for a
+deferred settlement), and atomically stores the request digest and response
+under $\Null$; exact retransmissions replay the stored response, so a
+network failure cannot burn a balance.
+
+\section{The proof circuit}
+\label{sec:circuit}
+
+The relation above is almost entirely SHAKE256: a direct-input spend proves
+two hidden sponge evaluations (old stream, fresh stream), a deferred-input
+spend proves three (the nested target costs one more). Everything else ---
+the MAYO equation and the balance arithmetic --- is quadratic. This section
+describes the three techniques that make the circuit small.
+
+\subsection{Degree-16 Keccak checkpointing}
+\label{sec:checkpoint}
+
+Keccak-$f[1600]$'s round function is degree 2 (the $\chi$ step is the only
+nonlinearity)~\cite{FIPS202}. The naive circuit commits all 1600 state bits
+after every round: 24 rounds $\times$ 1600 witness bits, with degree-2
+constraints between layers. But witness bits are the dominant cost in a
+VOLE-style proof (each consumes a VOLE coordinate, enlarging both the
+correction data and every leaf-PRG expansion), while raising the
+\emph{degree} of the batched QuickSilver check is cheap: a maximum degree
+$d$ costs $d$ published field elements and $d-1$ mask VOLEs \emph{in total}.
+
+We therefore commit the state only every \emph{four} rounds. Between
+checkpoints the circuit carries symbolic polynomial expressions: after
+rounds $1,2,3,4$ the expressions have degree $2,4,8,16$, and the checkpoint
+constraint asserts (per bit) that the degree-16 expression equals the next
+committed state --- a degree-16 polynomial constraint, the largest the
+implementation accepts. This quarters the per-permutation witness from
+$24 \times 1600$ to $6 \times 1600 = 9600$ bits. One permutation dominates
+each hidden SHAKE evaluation, so a direct spend's witness is about
+$21{,}700$ bits and a deferred spend's about $31{,}500$ --- versus roughly
+$79{,}000$ and $118{,}000$ without checkpointing. The prover-side cost is the
+schoolbook product of coefficient vectors in the expression layer, which is
+pure $\Ftag$ multiplication throughput ($\approx$1.1M multiplications per
+permutation) and benefits from carry-less multiply instructions.
+
+\subsection{The quadratic-system constraint for MAYO}
+\label{sec:quadsys}
+
+Verifying $P(\sigma) = y$ means checking $m = 64$ quadratic equations
+\[
+\sum_{r \le c} G_a[r,c]\; \sigma_r \sigma_c \;=\; y_a,
+\qquad a \in [m],
+\]
+over the \emph{same} $\approx \binom{325}{2} \approx 52{,}650$ products
+$\sigma_r \sigma_c$. Materializing each product as a committed wire would add
+$52{,}650$ witness bits (times four, as these are $\Fsixteen$ values);
+instead the backend supports a \emph{deferred quadratic system}: the prover
+records the values and tags of every term factor, and at challenge time the
+$m$ equations are folded into a single QuickSilver degree-2 check by random
+weights $\varphi_a \in \Ftag$ drawn from the transcript, with coefficients
+lifted through the embedding $\iota$. An unsatisfied equation survives the
+fold except with probability $2^{-\lambda}$. The committed signature nibbles
+enter as bit wires ($4 \cdot k_w n = 1296$ bits), and the fold costs the
+prover $O(m \cdot |\text{terms}|)$ table-lookup XORs --- data-independent,
+since the tables are indexed by public key coefficients. The same mechanism
+folds the 64 quadratic carry equations of each balance addition.
+
+\subsection{Balance arithmetic in $\Ftwo$}
+
+Additions are proven bitwise with committed carry vectors:
+$a_i + b_i + c_i = s_i$ linearly (over $\Ftwo$, addition is XOR --- an early
+design error we caught was writing balance equations additively over the tag
+field, where they say nothing about integers), and the carry recurrence
+$c_{i+1} = a_i b_i + c_i(a_i + b_i)$ quadratically via the folded system.
+Asserting the final carry to be zero makes every balance equation an exact
+statement about 64-bit unsigned integers, so conservation is enforced
+bit-exactly rather than modulo anything.
+
+\section{Security discussion}
+\label{sec:security}
+
+We summarize the intended arguments and their current status; a complete
+reduction for the composed system is future work, and the implementation
+carries an explicit prototype disclaimer.
+
+\paragraph{Soundness / fiscal safety.}
+An accepted spend implies, except with probability negligible in $\lambda$
+(via the VOLEitH extraction argument, the matrix consistency check of
+Section~\ref{sec:voleith}, and the quadratic-system fold), knowledge of a
+MAYO preimage for a well-formed credential digest, correct nullifier
+derivation, and exact balance arithmetic. Creating value therefore requires
+forging a MAYO preimage or finding structured SHAKE collisions. Double
+spending requires two accepted presentations of one credential, which reveal
+the same deterministic nullifier and are refused by the nullifier store
+(whose atomic retry semantics also make honest retransmission safe).
+
+\paragraph{Anonymity.}
+A spend reveals $(s, \Null, \Cred', \text{proof})$. The proof is
+zero-knowledge (honest-verifier ZK of the VOLEitH argument, compiled by
+Fiat--Shamir with a $2\lambda$-bit per-proof salt); $\Cred'$ is a fresh
+commitment whose hiding rests on the 256-bit nonce $\rho'$; and $\Null$ is
+the unrevealed suffix of an XOF stream whose prefix the issuer saw at
+issuance --- pseudorandom under standard sponge modeling. Consequently
+linking a spend to its issuance (or to a prior spend in the same chain)
+reduces to breaking the hash layer, \emph{not} the MAYO layer; anonymity
+survives a MAYO break. We stress the systemic caveat that spend \emph{amounts}
+are public, so deployments have an anonymity set bounded by amount and
+context patterns.
+
+\paragraph{Multi-instance hardening.}
+Every PRG and commitment call in the tree layer binds salt and position
+(after~\cite{OneTree}); a batch adversary attacking $Q$ proofs $\times$ $N$
+positions gains no advantage over attacking a single 128-bit seed. The wide
+consistency hash removes the $2^{-k}$ per-chunk cheating strategy. Domain
+tags separate every hash use; all encodings are canonical, length-framed,
+and rejected on any alternate serialization.
+
+\paragraph{Implementation posture.}
+All field arithmetic is branch-free with no secret-indexed table lookups
+(the $\Fsixteen$ kernels operate on packed lanes with mask-based selection;
+$\Ftag$ multiplication uses carry-less multiply instructions); MAYO's
+Gaussian elimination runs on a fixed public schedule with masked selection.
+Secret-bearing heap state (VOLE tags, expression coefficients, recorded
+constraints, tree seeds) is zeroized on drop, including panic paths, and
+constraint storage is pre-sized so growth reallocation can never copy
+secrets into unwiped freed memory. These are best-effort source-level
+properties, documented as such.
+
+\section{Parameters, sizes, and performance}
+\label{sec:performance}
+
+All measurements: research prototype, Rust, single Apple M4 Pro (10 cores
+used by the parallel tree layer), MAYO$_2$, $\lambda = 128$. Criterion
+benchmarks and the measurement harness agree to within a few percent.
+
+\begin{table}[h]
+\centering
+\caption{Wire sizes (bytes). Tokens are profile-independent; only
+proof-carrying requests grow with the low-latency profiles.}
+\label{tab:sizes}
+\begin{tabular}{lrrr}
+\toprule
+Object & compact & balanced & low-latency \\
+& $(\tau,k){=}(16,8)$ & $(32,4)$ & $(64,2)$ \\
+\midrule
+Token (either format) & 283 & 283 & 283 \\
+Issue request & 29\,750 & 55\,286 & 106\,358 \\
+Spend request (direct input) & 52\,990 & 101\,726 & 199\,198 \\
+Spend request (deferred input) & 72\,574 & 140\,894 & 277\,534 \\
+Issue / spend response & 171 / 179 & 171 / 179 & 171 / 179 \\
+Public key (expanded map) & 106\,319 & 106\,319 & 106\,319 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\caption{Operation latency, median of 15 (ms). ``Verify-and-sign'' is the
+complete issuer side including the MAYO preimage computation.}
+\label{tab:perf}
+\begin{tabular}{lrrr}
+\toprule
+Operation & compact & balanced & low-latency \\
+\midrule
+Issue: client prove            & 9.3  & 7.8  & 7.8 \\
+Issue: issuer verify-and-sign  & 4.0  & 2.9  & 2.9 \\
+Spend (direct): client prove   & 23.0 & 21.5 & 21.6 \\
+Spend (direct): issuer verify-and-sign & 9.0 & 7.5 & 7.5 \\
+Spend (deferred): client prove & 31.6 & 29.1 & 29.7 \\
+Spend (deferred): issuer verify-and-sign & 11.4 & 9.3 & 9.3 \\
+Deferred-return: issuer verify-and-sign & 9.0 & 7.5 & 7.5 \\
+Issue: end-to-end              & 14.3 & 11.7 & 11.7 \\
+Spend (direct): end-to-end     & 33.1 & 30.1 & 30.2 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Notably, after optimizing the tree layer (parallel GGM expansion, streaming
+pairwise-halving plane accumulation, hardware Keccak via the ARMv8.2-SHA3
+extension, and word-level $64{\times}64$ bit-matrix transposition of the
+VOLE plane data), the compact profile's latency penalty over low-latency has
+collapsed to $\approx$6\% while its proofs are $3.8\times$ smaller --- making
+compact the sensible default. An issuer core sustains $>$100
+verify-and-sign operations per second; the client prover, running once per
+transaction, is comfortably interactive.
+
+\section{Related work}
+
+VOLE-based designated-verifier ZK begins with
+Wolverine~\cite{Wolverine} and Mac'n'Cheese~\cite{MacNCheese};
+QuickSilver~\cite{QuickSilver} gives the degree-$d$ batched check we
+generalize. VOLE-in-the-Head~\cite{VOLEitH} removes the designated verifier
+and underlies the FAEST signature candidate~\cite{FAEST}, whose engineering
+(GGM trees, salting, consistency checking) we follow, with the hardening of
+\cite{OneTree}. MAYO~\cite{Beullens21,MAYOspec} descends from unbalanced
+oil-and-vinegar~\cite{UOV}; \cite{Beullens22} is the cautionary tale for the
+assumption class. Anonymous tokens and credentials span blind
+signatures~\cite{Chaum82}, CL signatures~\cite{CL01}, keyed-verification
+credentials from algebraic MACs~\cite{CMZ14}, and deployed unit-token
+systems~\cite{PrivacyPass}; VOLE-ACT is a post-quantum stateful-balance
+member of this family, instantiating the Katz--Schlesinger design~\cite{KS}.
+
+\section{Open problems}
+
+(1)~A complete security reduction for the composed system (VOLEitH extraction
+$+$ quadratic-system fold $+$ the credential/nullifier stream) in the QROM.
+(2)~A structured, non-materialized QuickSilver check for the whipped MAYO
+equation, removing the $O(m (k_w n)^2)$ expanded-form table and enabling the
+larger MAYO parameter sets.
+(3)~Hashing the compact public-key encoding (rather than the expanded forms)
+into the context --- a transcript-breaking cleanup best done before any
+format freeze.
+(4)~Aggregating or compressing spend proofs; at 53\,KiB the compact profile
+is deployable server-side but remains the dominant bandwidth cost.
+
+\begin{thebibliography}{99}\small
+
+\bibitem{Beullens21}
+W.~Beullens.
+\emph{MAYO: Practical Post-Quantum Signatures from Oil-and-Vinegar Maps}.
+SAC 2021.
+
+\bibitem{Beullens22}
+W.~Beullens.
+\emph{Breaking Rainbow Takes a Weekend on a Laptop}.
+CRYPTO 2022.
+
+\bibitem{MAYOspec}
+W.~Beullens, F.~Campos, S.~Celi, B.~Hess, M.~J.~Kannwischer.
+\emph{MAYO: Algorithm Specification}.
+NIST PQC Additional Digital Signatures, Round 2, 2024.
+
+\bibitem{VOLEitH}
+C.~Baum, L.~Braun, C.~Delpech de Saint Guilhem, M.~Kloo{\ss}, E.~Orsini,
+L.~Roy, P.~Scholl.
+\emph{Publicly Verifiable Zero-Knowledge and Post-Quantum Signatures from
+VOLE-in-the-Head}.
+CRYPTO 2023.
+
+\bibitem{FAEST}
+C.~Baum et al.
+\emph{FAEST: Algorithm Specification}.
+NIST PQC Additional Digital Signatures, Round 2, 2024.
+\url{https://faest.info}.
+
+\bibitem{OneTree}
+C.~Baum, W.~Beullens, S.~Mukherjee, E.~Orsini, S.~Ramacher, C.~Rechberger,
+L.~Roy, P.~Scholl.
+\emph{One Tree to Rule Them All: Optimizing GGM Trees and OWFs for
+Post-Quantum Signatures}.
+ASIACRYPT 2024.
+
+\bibitem{QuickSilver}
+K.~Yang, P.~Sarkar, C.~Weng, X.~Wang.
+\emph{QuickSilver: Efficient and Affordable Zero-Knowledge Proofs for
+Circuits and Polynomials over Any Field}.
+ACM CCS 2021.
+
+\bibitem{Wolverine}
+C.~Weng, K.~Yang, J.~Katz, X.~Wang.
+\emph{Wolverine: Fast, Scalable, and Communication-Efficient Zero-Knowledge
+Proofs for Boolean and Arithmetic Circuits}.
+IEEE S\&P 2021.
+
+\bibitem{MacNCheese}
+C.~Baum, A.~J.~Malozemoff, M.~B.~Rosen, P.~Scholl.
+\emph{Mac'n'Cheese: Zero-Knowledge Proofs for Boolean and Arithmetic
+Circuits with Nested Disjunctions}.
+CRYPTO 2021.
+
+\bibitem{SoftSpoken}
+L.~Roy.
+\emph{SoftSpokenOT: Quieter OT Extension from Small-Field Silent VOLE in the
+Minicrypt Model}.
+CRYPTO 2022.
+
+\bibitem{GGM86}
+O.~Goldreich, S.~Goldwasser, S.~Micali.
+\emph{How to Construct Random Functions}.
+Journal of the ACM 33(4), 1986.
+
+\bibitem{UOV}
+A.~Kipnis, J.~Patarin, L.~Goubin.
+\emph{Unbalanced Oil and Vinegar Signature Schemes}.
+EUROCRYPT 1999.
+
+\bibitem{FIPS202}
+NIST.
+\emph{SHA-3 Standard: Permutation-Based Hash and Extendable-Output
+Functions}.
+FIPS PUB 202, 2015.
+
+\bibitem{Chaum82}
+D.~Chaum.
+\emph{Blind Signatures for Untraceable Payments}.
+CRYPTO 1982.
+
+\bibitem{CL01}
+J.~Camenisch, A.~Lysyanskaya.
+\emph{An Efficient System for Non-transferable Anonymous Credentials with
+Optional Anonymity Revocation}.
+EUROCRYPT 2001.
+
+\bibitem{CMZ14}
+M.~Chase, S.~Meiklejohn, G.~Zaverucha.
+\emph{Algebraic MACs and Keyed-Verification Anonymous Credentials}.
+ACM CCS 2014.
+
+\bibitem{PrivacyPass}
+A.~Davidson, I.~Goldberg, N.~Sullivan, G.~Tankersley, F.~Valsorda.
+\emph{Privacy Pass: Bypassing Internet Challenges Anonymously}.
+PETS 2018.
+
+\bibitem{KS}
+J.~Katz, S.~Schlesinger.
+\emph{Anonymous Credit Tokens}.
+% NOTE: fill in venue / eprint number for the reference design.
+
+\end{thebibliography}
+
+\end{document}
