@@ -132,9 +132,9 @@ VOLE-in-the-Head is unusually harmonious on both counts:
 \paragraph{Contributions.}
 (1)~Syntax and game-based security definitions for anonymous credit tokens
 with issuer-settled (\emph{deferred-return}) spends
-(Section~\ref{sec:definitions}), including the exact assumption the issuer's
-preimage-oracle role forces: an adaptive \emph{one-more-preimage} property
-of the whipped MAYO map.
+(Section~\ref{sec:definitions}), including a candidate semi-formal
+statement of the assumption the issuer's preimage-oracle role forces: an
+adaptive \emph{one-more-preimage} property of the whipped MAYO map.
 (2)~A post-quantum construction from that assumption plus an ideal XOF
 (Section~\ref{sec:scheme}): one XOF stream yielding both commitment and
 nullifier; a typed two-format token state machine; and a deferred-return
@@ -319,9 +319,15 @@ record $b$; $\mathsf{SPEND}(\cdot)$; and $\mathsf{SPENDDEF}(\cdot, t')$,
 where $\adv$ names the desired return and the oracle enforces $t' \le s$
 and reports the applied $t'$ in its output (in the real system $t'$ is
 issuer policy; letting $\adv$ choose it is conservative). Rejected calls
-record nothing. Define the \emph{net redeemed value} of an accepted
-ordinary spend of public amount $s$ as $s$, and of an accepted deferred
-spend as $s - t'$. $\adv$ wins if at any point during the experiment
+record nothing, and accounting is per \emph{logical spend event}: each
+first durable consumption of a nullifier creates one record, an exact
+retransmission of the same request contributes zero additional redemption
+and returns the originally recorded response (including the original
+$t'$), and conflicting reuse of a consumed nullifier is rejected. External
+redemption of value must be idempotent at the same boundary. Define the
+\emph{net redeemed value} of a logical ordinary spend of public amount $s$
+as $s$, and of a logical deferred spend as $s - t'$. $\adv$ wins if at any
+point during the experiment
 \[
 \sum_{\text{accepted spends}} \text{net redeemed value}
 \;>\;
@@ -370,13 +376,15 @@ if $\beta' = \beta$; the scheme is spend-anonymous if
 $|\Pr[\beta' = \beta] - 1/2|$ is negligible.
 
 The same-kind, same-mode, same-amount, equal-balance restrictions reflect
-leakage the syntax makes public by design, and retiring the candidates and
-successor confines the definition to a single challenged spend ---
-without retirement, replaying a candidate would reveal $\beta$ through
-nullifier reuse, and the successors' differing balances would leak through
-follow-up amounts. A chain definition (hidden, permuted token handles with
-identical admissible continuations) is the natural strengthening and is
-left open. Section~\ref{sec:security} discusses the metadata any
+leakage the syntax makes public by design. Retiring the \emph{candidates}
+closes the immediate distinguisher: replaying a candidate would reveal
+$\beta$ through nullifier reuse. Retiring the \emph{successor} (whose
+balance is the same in both worlds, given equal candidate balances) is
+not needed against that attack; it isolates the definition to a single
+challenged transcript rather than smuggling in a compositional guarantee
+about continued use. A chain definition (hidden, permuted token handles
+with identical admissible continuations) is the natural strengthening and
+is left open. Section~\ref{sec:security} discusses the metadata any
 deployment leaks outside this game.
 \end{definition}
 
@@ -392,12 +400,15 @@ at most $Q_H$ (classical) queries. Call $y \in \Fsixteen^m$ an
 $w = (\kappa,b,\rho,t)$ --- the two target languages the protocol signs,
 under their respective domain tags. The adversary receives $\mathsf{pk}$
 and adaptive (classical) access to an oracle that, given an admissible
-target \emph{together with a valid opening}, returns
-$\Spre(\mathsf{sk}, y)$; this mirrors the protocol, where the issuer
-inverts only targets accompanied by a verified proof of opening knowledge.
-Repeated queries on the same target count once. After $q$ oracle queries
-the adversary must output $q+1$ triples $(y_j, w_j, \sigma_j)$ with the
-$y_j$ pairwise distinct admissible targets, $w_j$ valid openings, and
+target \emph{together with a valid opening}, returns an independently
+sampled $\Spre(\mathsf{sk}, y)$; this mirrors the protocol, where the
+issuer inverts only targets accompanied by a verified proof of opening
+knowledge, and \emph{resamples} on repeated requests (only exact spend
+retransmissions are answered from a cache, which the game models as no
+query at all). Every oracle call counts against $q$, so repeated calls on
+one target consume budget and yield fresh preimages. After $q$ oracle
+calls the adversary must output $q+1$ triples $(y_j, w_j, \sigma_j)$ with
+the $y_j$ pairwise distinct admissible targets, $w_j$ valid openings, and
 $P^\ast(\sigma_j) = y_j$. The assumption is that every efficient adversary
 succeeds with probability negligible in $\lambda$ (as a function of $q$
 and $Q_H$).
@@ -405,9 +416,10 @@ and $Q_H$).
 This is stronger and less studied than MAYO's signature unforgeability ---
 the issuer here \emph{is} a preimage oracle. PoMFRIT~\cite{PoMFRIT}
 formalizes an $(n,q)$ variant with $n$ \emph{random} targets and at most
-$q$ inversions; bridging that game to the adaptive, opening-accompanied,
-two-language version above (and stating a QROM variant with quantum XOF
-access) is part of the outstanding analysis, not a citation we inherit.
+$q$ inversions, likewise charging every inversion call; bridging that game
+to the adaptive, opening-accompanied, two-language version above (and
+stating a QROM variant with quantum XOF access) is part of the outstanding
+analysis, not a citation we inherit.
 \end{assumption}
 
 \begin{remark}[Hash modeling and adversary class]
@@ -507,20 +519,29 @@ statement (all public values, tags, and $\ctx$) bound into Fiat--Shamir.
   $(\kappa', \rho')$, set $b' = \mathsf{bal}(T) - s$, compute $\Cred'$ and
   $\Null$ from $T$'s stream; send $(s, \Null, \Cred', \pi)$ for the spend
   relation of Section~\ref{sec:relation} (typed for $T$'s kind, settlement
-  tag ``spend''). Issuer: verify; atomically insert
-  $(\Null, \text{request digest}, \text{response})$, replaying the stored
-  response on exact retry and rejecting conflicting reuse; return
-  $\sigma' \gets \Spre(\mathsf{sk}, \Cred')$. Client: accept the direct
-  token $(\sigma', \kappa', b', \rho')$ iff $P^\ast(\sigma') = \Cred'$.
+  tag ``spend''). Issuer: if the store already holds a record for $\Null$
+  with the same request digest, return the stored response; on a digest
+  conflict, reject. Otherwise verify $\pi$, sample
+  $\sigma' \gets \Spre(\mathsf{sk}, \Cred')$, construct the candidate
+  record $(\Null, \text{request digest}, \sigma')$, \emph{atomically}
+  insert it, and return whichever record won the insertion race. Client:
+  accept the direct token $(\sigma', \kappa', b', \rho')$ iff
+  $P^\ast(\sigma') = \Cred'$.
   \item $\mathsf{SpendDeferred}$: as $\mathsf{Spend}$ with settlement tag
-  ``deferred-return-spend''; after verification and nullifier insertion
-  the issuer picks $t' \le s$ and returns $(t', \sigma')$ with
-  $\sigma' \gets \Spre(\mathsf{sk}, \Def(\ctx, \Cred', t'))$. Client:
-  accept the deferred-return token $(\sigma', \kappa', b', \rho', t')$ iff
-  $t' \le s$ and $P^\ast(\sigma') = \Def(\ctx, \Cred', t')$.
-  \item $\mathsf{VerifyToken}(\mathsf{pk}, T)$: recompute $T$'s target
-  ($\Cred$ or $\Def$) from its opening and check
-  $P^\ast(\sigma) = \text{target}$.
+  ``deferred-return-spend'', except the issuer, after verifying $\pi$,
+  first picks $t' \le s$, then samples
+  $\sigma' \gets \Spre(\mathsf{sk}, \Def(\ctx, \Cred', t'))$, constructs
+  the candidate record containing $(t', \sigma')$, atomically inserts, and
+  returns the durable winner. Client: accept the deferred-return token
+  $(\sigma', \kappa', b', \rho', t')$ iff $t' \le s$ and
+  $P^\ast(\sigma') = \Def(\ctx, \Cred', t')$.
+  \item $\mathsf{VerifyToken}(\mathsf{pk}, T)$: check that $T$'s stored
+  context equals the context derived from $\mathsf{pk}$; that its
+  credential kind and top-up obey the format's convention (a direct token
+  carries no top-up); that the effective balance does not overflow;
+  recompute $T$'s target ($\Cred$ or $\Def$) from its opening; and check
+  $P^\ast(\sigma) = \text{target}$. (The anonymity game relies on honest
+  clients performing \emph{all} of these checks.)
 \end{itemize}
 \caption{The VOLE-ACT algorithms. Every request and response carries the
 credential-kind and settlement-mode tags; request digests bind the full
@@ -644,7 +665,12 @@ cases are: two credential-stream openings with equal $\Cred$; two
 deferred wrappers with equal $\Def$ output; and a cross-domain collision
 $\Cred = \Def(\cdot)$ --- the domain tags separate the hash inputs, but
 all three remain generic collision events in the same $4m$-bit output
-space and must be counted. Issuance soundness matters because
+space and must be counted. A fourth, operational collision event: the
+retry store retains a 256-bit \emph{request digest} rather than the full
+request, so exact-retry semantics additionally assume collision
+resistance of that digest (or full-request comparison), and the redeemed
+service itself --- not merely the token response --- must be tied
+idempotently to the first durable record. Issuance soundness matters because
 Assumption~\ref{ass:omp} feeds the oracle only opening-accompanied
 targets: without it, a malicious issuance request could obtain a preimage
 for an unopened target. The dominant known terms and generic ceilings
