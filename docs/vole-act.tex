@@ -787,8 +787,8 @@ interfaces. $\mathsf{digest}(\ctx, \mathit{req}) =
    \mathit{st} = (\kappa, b, \rho, \Cred))}
 \pchspace
 \procedure{$\mathsf{Issue.Issuer}(\mathsf{sk}, \ctx, b, (\Cred, \pi))$}{%
- \pccomment{$b$ is the externally authorized session input, not part of
-   the request} \\
+ \pccomment{$b$: externally authorized} \\
+ \pccomment{session input, not in the request} \\
  \text{require } \Pi.\mathsf{Verify}(\mathcal{R}_{\mathsf{issue}},
    (\ctx, b, \Cred), \pi) \\
  \pcreturn \sigma \sample \Spre(\mathsf{sk}, \Cred)}
