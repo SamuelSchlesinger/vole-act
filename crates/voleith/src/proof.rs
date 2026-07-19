@@ -43,7 +43,7 @@ use vector_commit::{MAX_DEPTH, SALT_LEN, Seed, VcCommitment, VcOpening};
 use zeroize::{Zeroize, Zeroizing};
 
 const PROTOCOL_LABEL: &[u8] = b"VOLE-ACT/voleith/v1";
-const MAX_DEGREE: usize = 16;
+pub(crate) use crate::backend::MAX_DEGREE;
 const PROOF_WIRE_MAGIC: &[u8; 4] = b"VITH";
 const PROOF_WIRE_VERSION: u8 = 1;
 
@@ -398,6 +398,10 @@ impl WideHashKey {
 }
 
 /// Evaluate the wide hash on one bit-vector column.
+///
+/// The `x0` chunks start at multiples of 128 bits, so each is two aligned
+/// 64-bit words of the vector (masked to the chunk's logical length —
+/// identical to the definitional bit-by-bit gather).
 fn wide_hash_bits(key: WideHashKey, input: &BitVec) -> GF2p128 {
     debug_assert!(input.len() >= 128);
     let x0_len = input.len() - 128;
@@ -405,9 +409,10 @@ fn wide_hash_bits(key: WideHashKey, input: &BitVec) -> GF2p128 {
     let mut ht = GF2p128::ZERO;
     for base in (0..x0_len).step_by(128) {
         let take = (x0_len - base).min(128);
-        let mut chunk = 0u128;
-        for bit in 0..take {
-            chunk |= (input.get(base + bit) as u128) << bit;
+        let word = base / 64;
+        let mut chunk = input.word64(word) as u128 | ((input.word64(word + 1) as u128) << 64);
+        if take < 128 {
+            chunk &= (1u128 << take) - 1;
         }
         let chunk = GF2p128::new(chunk);
         hs = hs * key.s + chunk;
@@ -423,6 +428,9 @@ fn wide_hash_bits(key: WideHashKey, input: &BitVec) -> GF2p128 {
 /// Apply the same wide hash to every column of an `input.len() × 128`
 /// bit matrix whose rows are packed as field elements. The result uses the
 /// same row-packed representation and therefore has exactly 128 elements.
+///
+/// The per-block column gather and the final row packing are 128×128 bit
+/// transposes, done word-level; the arithmetic is unchanged.
 fn wide_hash_rows(key: WideHashKey, input: &[GF2p128]) -> Vec<GF2p128> {
     debug_assert!(input.len() >= 128);
     let x0_len = input.len() - 128;
@@ -431,13 +439,11 @@ fn wide_hash_rows(key: WideHashKey, input: &[GF2p128]) -> Vec<GF2p128> {
 
     for base in (0..x0_len).step_by(128) {
         let take = (x0_len - base).min(128);
-        let mut columns = [0u128; 128];
-        for row in 0..take {
-            let bits = input[base + row].to_u128();
-            for (column, value) in columns.iter_mut().enumerate() {
-                *value |= ((bits >> column) & 1) << row;
-            }
+        let mut rows = [0u128; 128];
+        for (row, elem) in input[base..base + take].iter().enumerate() {
+            rows[row] = elem.to_u128();
         }
+        let columns = crate::bits::transpose128(&rows);
         for column in 0..128 {
             let chunk = GF2p128::new(columns[column]);
             hs[column] = hs[column] * key.s + chunk;
@@ -445,15 +451,12 @@ fn wide_hash_rows(key: WideHashKey, input: &[GF2p128]) -> Vec<GF2p128> {
         }
     }
 
-    let mixed: [GF2p128; 128] =
-        core::array::from_fn(|column| key.r0 * hs[column] + key.r1 * ht[column]);
+    let mixed: [u128; 128] =
+        core::array::from_fn(|column| (key.r0 * hs[column] + key.r1 * ht[column]).to_u128());
+    let packed_rows = crate::bits::transpose128(&mixed);
     let mut out = vec![GF2p128::ZERO; 128];
     for (row, packed) in out.iter_mut().enumerate() {
-        let mut bits = 0u128;
-        for (column, value) in mixed.iter().enumerate() {
-            bits |= ((value.to_u128() >> row) & 1) << column;
-        }
-        *packed = GF2p128::new(bits) + input[x0_len + row];
+        *packed = GF2p128::new(packed_rows[row]) + input[x0_len + row];
     }
     out
 }
@@ -554,7 +557,11 @@ pub(crate) fn prove_impl<C: Circuit>(
     params.validate()?;
     let lambda = params.lambda();
 
-    // Size the circuit.
+    // Size the circuit. `max_built_degree` covers every expression the
+    // circuit constructs (asserted or not), so the inline expression storage
+    // in the cryptographic backends can never overflow; only the *asserted*
+    // degree sizes the VOLE, keeping the transcript of accepted circuits
+    // unchanged.
     let mut counter = CountingBackend::default();
     circuit.build(&mut counter)?;
     let l = counter.witness_bits;
@@ -562,7 +569,7 @@ pub(crate) fn prove_impl<C: Circuit>(
     if l == 0 {
         return Err(VoleithError::InvalidParameters);
     }
-    if max_degree > MAX_DEGREE {
+    if max_degree > MAX_DEGREE || counter.max_built_degree > MAX_DEGREE {
         return Err(VoleithError::InvalidParameters);
     }
     if witness.len() != l {
@@ -584,9 +591,11 @@ pub(crate) fn prove_impl<C: Circuit>(
     let mut vole = vole_result.map_err(|_| VoleithError::InvalidParameters)?;
 
     // Run the circuit: collects d corrections and constraint coefficients.
-    let mut backend = ProverBackend::new(witness, &vole.u, &vole.tags);
+    // The constraint capacity from the counting pass guarantees no growth
+    // reallocation while the vector holds secret coefficients.
+    let mut backend = ProverBackend::new(witness, &vole.u, &vole.tags, counter.constraints);
     circuit.build(&mut backend)?;
-    if backend.bits_used() != l {
+    if backend.bits_used() != l || backend.constraints.len() != counter.constraints {
         return Err(VoleithError::WitnessMismatch);
     }
     if enforce_satisfied && !backend.satisfied {
@@ -639,9 +648,17 @@ pub(crate) fn prove_impl<C: Circuit>(
         mask_tag.zeroize();
     }
     drop(masks);
+    // One reused stack scratch buffer for the per-constraint coefficients
+    // (secret data; fully wiped on every exit path via `Zeroizing`).
+    let mut coefficients = Zeroizing::new([GF2p128::ZERO; MAX_DEGREE + 1]);
     for constraint in &backend.constraints {
-        let coefficients = Zeroizing::new(match constraint {
-            ProverConstraint::Simple(a0, a1) => vec![*a0, *a1, GF2p128::ZERO],
+        let filled = match constraint {
+            ProverConstraint::Simple(a0, a1) => {
+                coefficients[0] = *a0;
+                coefficients[1] = *a1;
+                coefficients[2] = GF2p128::ZERO;
+                3
+            }
             ProverConstraint::System(sys) => {
                 let phis: Vec<GF2p128> = (0..sys.num_equations())
                     .map(|_| next_elem(&mut chi))
@@ -650,19 +667,21 @@ pub(crate) fn prove_impl<C: Circuit>(
                 if enforce_satisfied && error != GF2p128::ZERO {
                     return Err(VoleithError::Unsatisfiable);
                 }
-                vec![a0, a1, error]
+                coefficients[0] = a0;
+                coefficients[1] = a1;
+                coefficients[2] = error;
+                3
             }
-            ProverConstraint::Polynomial(coefficients) => coefficients.clone(),
-        });
+            ProverConstraint::Polynomial(poly) => {
+                coefficients[..poly.len()].copy_from_slice(poly.as_slice());
+                poly.len()
+            }
+        };
         let x = next_elem(&mut chi);
         // The leading coefficient is the asserted circuit value. The prover
         // claims it is zero by omitting it; the verifier's evaluation retains
         // it and therefore detects a false claim at the final random point.
-        align_and_accumulate(
-            &mut qs_coefficients,
-            &coefficients[..coefficients.len() - 1],
-            x,
-        );
+        align_and_accumulate(&mut qs_coefficients, &coefficients[..filled - 1], x);
     }
     let mut qs_bytes = Vec::with_capacity(16 * max_degree);
     for coefficient in &qs_coefficients {
@@ -702,7 +721,9 @@ pub fn verify<C: Circuit>(
     params.validate()?;
     let lambda = params.lambda();
 
-    // Size the circuit and validate proof shape.
+    // Size the circuit and validate proof shape. The built-degree bound
+    // mirrors the prover exactly, so a circuit is rejected by both sides or
+    // by neither.
     let mut counter = CountingBackend::default();
     circuit.build(&mut counter)?;
     let l = counter.witness_bits;
@@ -710,7 +731,7 @@ pub fn verify<C: Circuit>(
     if l == 0 {
         return Err(VoleithError::InvalidParameters);
     }
-    if max_degree > MAX_DEGREE {
+    if max_degree > MAX_DEGREE || counter.max_built_degree > MAX_DEGREE {
         return Err(VoleithError::InvalidParameters);
     }
     let l_hat = l + max_degree * lambda;
@@ -801,15 +822,21 @@ pub fn verify<C: Circuit>(
 
     // Degree-d QuickSilver check. Mask group j contributes `Δʲ·Kⱼ`,
     // pairing its tag with coefficient j and its value with j+1.
+    // `Δ^i` is precomputed up to `max_degree`; every degree below is bounded
+    // by the counting pass, so the table covers all lookups.
+    let mut delta_pows = vec![GF2p128::ONE; max_degree + 1];
+    for i in 1..=max_degree {
+        delta_pows[i] = delta_pows[i - 1] * delta;
+    }
     let mask_keys = qs_mask_groups(l, lambda, max_degree - 1, None, &keys);
     let mut acc = GF2p128::ZERO;
     for (degree, (_, key)) in mask_keys.into_iter().enumerate() {
-        acc += key * delta.pow(degree as u128);
+        acc += key * delta_pows[degree];
     }
     for check in &backend.checks {
         let value = verifier_constraint_evaluation(check, &mut chi, delta);
         let x = next_elem(&mut chi);
-        acc += x * value * delta.pow((max_degree - constraint_degree(check)) as u128);
+        acc += x * value * delta_pows[max_degree - constraint_degree(check)];
     }
     if acc != evaluate_polynomial(&proof.qs_coefficients, delta) {
         return Err(VoleithError::InvalidProof);
@@ -909,6 +936,53 @@ mod soundness_tests {
                 "false degree-16 assertion accepted at seed {seed}"
             );
         }
+    }
+
+    /// Builds (and discards) an expression of degree `MAX_DEGREE + 1`
+    /// without asserting it, then asserts an innocuous degree-2 relation.
+    /// Regression for the inline expression storage: both `prove` and
+    /// `verify` must reject this circuit cleanly (never panic), and they
+    /// must reject it symmetrically.
+    struct DiscardedOverDegree;
+
+    impl Circuit for DiscardedOverDegree {
+        fn build<B: Backend>(&self, backend: &mut B) -> Result<(), VoleithError> {
+            let bit = backend.witness_bit()?;
+            let base = backend.wire_expr(&bit);
+            let mut expression = base.clone();
+            for _ in 0..MAX_DEGREE {
+                expression = backend.expr_mul(&expression, &base);
+            }
+            drop(expression);
+            backend.assert_zero(&bit);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn discarded_over_degree_expression_is_rejected_not_panicked() {
+        let mut rng = StdRng::seed_from_u64(0xDD_0001);
+        assert_eq!(
+            prove_impl(
+                &PARAMS_128,
+                b"over-degree",
+                &DiscardedOverDegree,
+                &[false],
+                &mut rng,
+                true,
+            )
+            .unwrap_err(),
+            VoleithError::InvalidParameters
+        );
+
+        // The verifier applies the same bound: an arbitrary well-formed proof
+        // against this circuit is rejected as InvalidParameters, matching the
+        // prover, before any proof material is inspected.
+        let ok = prove_impl(&PARAMS_128, b"az", &AssertBitZero, &[false], &mut rng, true).unwrap();
+        assert_eq!(
+            verify(&PARAMS_128, b"over-degree", &DiscardedOverDegree, &ok),
+            Err(VoleithError::InvalidParameters)
+        );
     }
 
     struct DegreeDZero(usize);

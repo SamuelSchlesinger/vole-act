@@ -114,6 +114,63 @@ impl BitVec {
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
     }
+
+    /// Read the `w`-th 64-bit little-endian word (bits `[64w, 64w+64)`),
+    /// zero-padded past the end of the vector.
+    #[must_use]
+    pub(crate) fn word64(&self, w: usize) -> u64 {
+        let start = (w * 8).min(self.bytes.len());
+        let end = (start + 8).min(self.bytes.len());
+        let mut buf = [0u8; 8];
+        buf[..end - start].copy_from_slice(&self.bytes[start..end]);
+        u64::from_le_bytes(buf)
+    }
+}
+
+/// Transpose a 128×128 bit matrix given as 128 `u128` rows (bit `i`,
+/// LSB-first, is column `i`): `out[c]` bit `r` equals `rows[r]` bit `c`.
+/// Built from four 64×64 tile transposes; branch-free and secret-independent.
+pub(crate) fn transpose128(rows: &[u128; 128]) -> [u128; 128] {
+    let mut tile_a = [0u64; 64]; // rows 0..64,   columns 0..64
+    let mut tile_b = [0u64; 64]; // rows 0..64,   columns 64..128
+    let mut tile_c = [0u64; 64]; // rows 64..128, columns 0..64
+    let mut tile_d = [0u64; 64]; // rows 64..128, columns 64..128
+    for i in 0..64 {
+        tile_a[i] = rows[i] as u64;
+        tile_b[i] = (rows[i] >> 64) as u64;
+        tile_c[i] = rows[64 + i] as u64;
+        tile_d[i] = (rows[64 + i] >> 64) as u64;
+    }
+    transpose64(&mut tile_a);
+    transpose64(&mut tile_b);
+    transpose64(&mut tile_c);
+    transpose64(&mut tile_d);
+    core::array::from_fn(|c| {
+        if c < 64 {
+            tile_a[c] as u128 | ((tile_c[c] as u128) << 64)
+        } else {
+            tile_b[c - 64] as u128 | ((tile_d[c - 64] as u128) << 64)
+        }
+    })
+}
+
+/// In-place transpose of a 64×64 bit matrix: bit `i` (LSB-first) of row `k`
+/// moves to bit `k` of row `i`. Branch-free and secret-independent: the
+/// access pattern and operation count depend only on the (public) dimensions.
+pub(crate) fn transpose64(a: &mut [u64; 64]) {
+    let mut j = 32usize;
+    let mut m = 0x0000_0000_FFFF_FFFFu64;
+    while j != 0 {
+        let mut k = 0usize;
+        while k < 64 {
+            let t = ((a[k] >> j) ^ a[k + j]) & m;
+            a[k] ^= t << j;
+            a[k + j] ^= t;
+            k = (k + j + 1) & !j;
+        }
+        j >>= 1;
+        m ^= m << j;
+    }
 }
 
 impl Zeroize for BitVec {
@@ -143,6 +200,68 @@ mod tests {
         b.set(9, true);
         a.xor_assign(&b);
         assert!(a.get(0) && !a.get(18) && a.get(9));
+    }
+
+    #[test]
+    fn transpose64_is_transpose() {
+        // Deterministic pseudo-random matrix; check the defining property
+        // bit-by-bit and the involution A^TT = A.
+        let mut state = 0x0123_4567_89AB_CDEFu64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let original: [u64; 64] = core::array::from_fn(|_| next());
+        let mut t = original;
+        transpose64(&mut t);
+        for (row, row_word) in t.iter().enumerate() {
+            for column in 0..64 {
+                assert_eq!(
+                    (row_word >> column) & 1,
+                    (original[column] >> row) & 1,
+                    "transpose bit ({row}, {column})"
+                );
+            }
+        }
+        transpose64(&mut t);
+        assert_eq!(t, original);
+    }
+
+    #[test]
+    fn transpose128_is_transpose() {
+        let mut state = 0xFEED_FACE_CAFE_BEEFu64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let rows: [u128; 128] = core::array::from_fn(|_| next() as u128 | ((next() as u128) << 64));
+        let t = transpose128(&rows);
+        for (column, t_word) in t.iter().enumerate() {
+            for (row, row_word) in rows.iter().enumerate() {
+                assert_eq!(
+                    (t_word >> row) & 1,
+                    (row_word >> column) & 1,
+                    "transpose bit ({row}, {column})"
+                );
+            }
+        }
+        let back = transpose128(&t);
+        assert_eq!(back, rows);
+    }
+
+    #[test]
+    fn word64_reads_and_pads() {
+        let mut v = BitVec::zero(70);
+        v.set(0, true);
+        v.set(63, true);
+        v.set(69, true);
+        assert_eq!(v.word64(0), 1u64 | (1u64 << 63));
+        assert_eq!(v.word64(1), 1u64 << 5);
+        assert_eq!(v.word64(2), 0);
     }
 
     #[test]

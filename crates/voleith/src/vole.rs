@@ -100,16 +100,39 @@ fn expand_leaf(salt: &[u8; SALT_LEN], j: usize, i: usize, seed: &Seed, l_hat: us
 /// Assemble per-coordinate `F₂^λ` elements from τ·k bit planes.
 ///
 /// `planes[j][b]` holds bit `jk + b` of every coordinate's field element.
+/// Implemented as a word-level 128×64 bit-matrix transpose per 64-coordinate
+/// block: identical output to the definitional per-bit loop (each
+/// (coordinate, bit-position) pair contributes exactly once), with no
+/// data-dependent branches on the secret plane bits.
 fn assemble(planes: &[Vec<BitVec>], params: &Params, l_hat: usize) -> Vec<GF2p128> {
+    // Both callers run `params.validate()` first (τ·k = λ = 128) and build
+    // exactly τ inner vectors of k planes; the shape asserts pin the
+    // `pos = j·k + b` mapping the flattened order must reproduce.
+    assert_eq!(planes.len(), params.tau);
+    assert!(
+        planes
+            .iter()
+            .all(|tree_planes| tree_planes.len() == params.k)
+    );
+    let flat: Vec<&BitVec> = planes.iter().flatten().collect();
+    assert_eq!(flat.len(), 128);
+
     let mut out = vec![GF2p128::ZERO; l_hat];
-    for (j, tree_planes) in planes.iter().enumerate() {
-        for (b, plane) in tree_planes.iter().enumerate() {
-            let pos = (j * params.k + b) as u32;
-            for (t, elem) in out.iter_mut().enumerate() {
-                if plane.get(t) {
-                    *elem += GF2p128::new(1u128 << pos);
-                }
+    for (w, block) in out.chunks_mut(64).enumerate() {
+        let mut lo = [0u64; 64];
+        let mut hi = [0u64; 64];
+        for (pos, plane) in flat.iter().enumerate() {
+            let word = plane.word64(w);
+            if pos < 64 {
+                lo[pos] = word;
+            } else {
+                hi[pos - 64] = word;
             }
+        }
+        crate::bits::transpose64(&mut lo);
+        crate::bits::transpose64(&mut hi);
+        for (i, elem) in block.iter_mut().enumerate() {
+            *elem = GF2p128::new(lo[i] as u128 | ((hi[i] as u128) << 64));
         }
     }
     out
@@ -304,6 +327,69 @@ pub fn split_delta(chall: &[u8; 16], params: &Params) -> (GF2p128, Vec<usize>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The definitional per-bit implementation of [`assemble`], kept as the
+    /// test oracle for the word-transpose fast path.
+    fn assemble_reference(planes: &[Vec<BitVec>], params: &Params, l_hat: usize) -> Vec<GF2p128> {
+        let mut out = vec![GF2p128::ZERO; l_hat];
+        for (j, tree_planes) in planes.iter().enumerate() {
+            for (b, plane) in tree_planes.iter().enumerate() {
+                let pos = (j * params.k + b) as u32;
+                for (t, elem) in out.iter_mut().enumerate() {
+                    if plane.get(t) {
+                        *elem += GF2p128::new(1u128 << pos);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn assemble_matches_reference() {
+        // Cover word-aligned and ragged lengths, and every validate()-legal
+        // parameter point (τ·k = 128 with k ≤ 24), not only the shipped
+        // profiles — the plane partition differs at the extremes.
+        for params in [
+            PARAMS_128,
+            PARAMS_128_BALANCED,
+            PARAMS_128_FAST,
+            Params { tau: 128, k: 1 },
+            Params { tau: 8, k: 16 },
+        ] {
+            for l_hat in [1usize, 63, 64, 65, 300, 512, 1000] {
+                let mut state = 0x1234_5678_9ABC_DEF0u64 ^ (params.tau as u64) << 32;
+                let mut next = || {
+                    // Deterministic xorshift; test-only data generator.
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    state
+                };
+                let planes: Vec<Vec<BitVec>> = (0..params.tau)
+                    .map(|_| {
+                        (0..params.k)
+                            .map(|_| {
+                                let mut plane = BitVec::zero(l_hat);
+                                for t in 0..l_hat {
+                                    plane.set(t, next() & 1 == 1);
+                                }
+                                plane
+                            })
+                            .collect()
+                    })
+                    .collect();
+                assert_eq!(
+                    assemble(&planes, &params, l_hat),
+                    assemble_reference(&planes, &params, l_hat),
+                    "tau={} k={} l_hat={}",
+                    params.tau,
+                    params.k,
+                    l_hat
+                );
+            }
+        }
+    }
 
     /// The fundamental invariant: for every coordinate `t`,
     /// `Kₜ = Vₜ + uₜ·Δ`. This single test validates the leaf expansion,

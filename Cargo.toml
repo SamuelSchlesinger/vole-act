@@ -23,7 +23,11 @@ mayo = { path = "crates/mayo" }
 
 # External
 rand_core = "0.6.4"
-sha3 = "0.10"
+# The `asm` feature enables the ARMv8.2-SHA3 hardware Keccak permutation on
+# aarch64 (runtime-detected; other targets keep the portable code). Same
+# permutation output; the dispatch branch depends only on CPU capability,
+# never on secret data.
+sha3 = { version = "0.10", features = ["asm"] }
 zeroize = "1.8"
 
 # Dev

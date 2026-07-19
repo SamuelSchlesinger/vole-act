@@ -280,7 +280,15 @@ fn keccak_linear_expr<B: Backend>(backend: &mut B, state: &[B::Expr]) -> Vec<B::
         }
     }
 
-    let mut permuted = vec![zero; 1600];
+    theta
+}
+
+/// Index map for ρ and π: entry `64·lane + z` names the θ-state position
+/// whose bit lands at `(lane, z)` after the rotation and lane permutation
+/// (`B'[y, 2x+3y] = rot(B[x, y])`). Reading θ through this map avoids
+/// materializing (and copying) the permuted expression vector each round.
+fn pi_rho_index() -> [usize; 1600] {
+    let mut index = [0usize; 1600];
     for y in 0..5 {
         for x in 0..5 {
             let source_lane = x + 5 * y;
@@ -289,15 +297,16 @@ fn keccak_linear_expr<B: Backend>(backend: &mut B, state: &[B::Expr]) -> Vec<B::
             let target_lane = target_x + 5 * target_y;
             for z in 0..64 {
                 let source_z = (z + 64 - RHO[source_lane] as usize) % 64;
-                permuted[64 * target_lane + z] = theta[64 * source_lane + source_z].clone();
+                index[64 * target_lane + z] = 64 * source_lane + source_z;
             }
         }
     }
-    permuted
+    index
 }
 
 fn keccak_round_expr<B: Backend>(backend: &mut B, state: &[B::Expr], rc: u64) -> Vec<B::Expr> {
-    let linear = keccak_linear_expr(backend, state);
+    let theta = keccak_linear_expr(backend, state);
+    let pi = pi_rho_index();
     let one = backend.constant(GF2p128::ONE);
     let one = backend.wire_expr(&one);
     let mut output = Vec::with_capacity(1600);
@@ -306,9 +315,9 @@ fn keccak_round_expr<B: Backend>(backend: &mut B, state: &[B::Expr], rc: u64) ->
         let z = bit_index % 64;
         let x = lane % 5;
         let y = lane / 5;
-        let p0 = &linear[64 * (x + 5 * y) + z];
-        let p1 = &linear[64 * ((x + 1) % 5 + 5 * y) + z];
-        let p2 = &linear[64 * ((x + 2) % 5 + 5 * y) + z];
+        let p0 = &theta[pi[64 * (x + 5 * y) + z]];
+        let p1 = &theta[pi[64 * ((x + 1) % 5 + 5 * y) + z]];
+        let p2 = &theta[pi[64 * ((x + 2) % 5 + 5 * y) + z]];
         let not_p1 = backend.expr_add(&one, p1);
         let product = backend.expr_mul(&not_p1, p2);
         let mut bit = backend.expr_add(p0, &product);

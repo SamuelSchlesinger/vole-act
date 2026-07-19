@@ -18,6 +18,63 @@ use crate::VoleithError;
 use binary_fields::{BinaryField, GF2p128, GF16, embed_gf16};
 use zeroize::Zeroize;
 
+/// Maximum polynomial degree accepted by proving and verification. Shared
+/// with `proof.rs`, which rejects any circuit whose counted degree exceeds
+/// it before either cryptographic backend runs.
+pub(crate) const MAX_DEGREE: usize = 16;
+
+/// Inline, fixed-capacity polynomial coefficient list (low-to-high order).
+///
+/// The circuit hot path creates millions of short coefficient vectors per
+/// proof; keeping them inline (capacity `MAX_DEGREE + 1`, the largest size
+/// `prove`/`verify` accept) removes per-expression heap allocation and lets
+/// constraint zeroization run as one linear sweep.
+#[derive(Clone, Copy, Debug)]
+pub struct PolyCoeffs {
+    len: u8,
+    slots: [GF2p128; MAX_DEGREE + 1],
+}
+
+impl PolyCoeffs {
+    const CAPACITY: usize = MAX_DEGREE + 1;
+
+    fn zeroed(len: usize) -> Self {
+        debug_assert!(len <= Self::CAPACITY);
+        PolyCoeffs {
+            len: len as u8,
+            slots: [GF2p128::ZERO; Self::CAPACITY],
+        }
+    }
+
+    /// The coefficients, low-to-high.
+    #[must_use]
+    pub fn as_slice(&self) -> &[GF2p128] {
+        &self.slots[..self.len as usize]
+    }
+
+    /// Number of coefficients (degree + 1).
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    /// Whether the list is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl Zeroize for PolyCoeffs {
+    fn zeroize(&mut self) {
+        // Per-field volatile stores, matching the zeroize crate's guarantee.
+        // (Measured: a whole-struct `zeroize_flat_type` wipe is *slower* here —
+        // LLVM lowers large volatile aggregate writes poorly.)
+        self.slots.zeroize();
+        self.len.zeroize();
+    }
+}
+
 /// Build the 16-entry lookup table `nib ↦ φ·embed(nib)` for one fold
 /// coefficient, so that folding a GF(16)-coefficient equation system costs
 /// one table lookup + XOR per (term, equation) instead of a field multiply.
@@ -27,12 +84,27 @@ fn fold_table(phi: GF2p128) -> [GF2p128; 16] {
 
 /// Fold per-term GF(16) coefficient vectors with the tables of all
 /// equations: `c_t = Σ_e φ_e·embed(coeffs_t[e])`.
+///
+/// Four independent accumulators break the serial XOR dependency chain so
+/// the table loads pipeline; XOR is associative and commutative, so the
+/// regrouped sum is bit-identical to the definitional left fold.
 fn fold_coeff(tables: &[[GF2p128; 16]], coeffs: &[GF16]) -> GF2p128 {
-    let mut acc = GF2p128::ZERO;
-    for (table, &c) in tables.iter().zip(coeffs.iter()) {
-        acc += table[c.to_u8() as usize];
+    // Equal lengths are enforced when the system is stored; the chunked
+    // walk below is only pairwise-equivalent to a plain zip under it.
+    debug_assert_eq!(tables.len(), coeffs.len());
+    let (table_chunks, table_rest) = tables.as_chunks::<4>();
+    let (coeff_chunks, coeff_rest) = coeffs.as_chunks::<4>();
+    let mut acc = [GF2p128::ZERO; 4];
+    for (t4, c4) in table_chunks.iter().zip(coeff_chunks.iter()) {
+        acc[0] += t4[0][c4[0].to_u8() as usize];
+        acc[1] += t4[1][c4[1].to_u8() as usize];
+        acc[2] += t4[2][c4[2].to_u8() as usize];
+        acc[3] += t4[3][c4[3].to_u8() as usize];
     }
-    acc
+    for (table, &c) in table_rest.iter().zip(coeff_rest.iter()) {
+        acc[0] += table[c.to_u8() as usize];
+    }
+    (acc[0] + acc[1]) + (acc[2] + acc[3])
 }
 
 /// A circuit whose satisfiability is proven. Implementations must be
@@ -119,6 +191,12 @@ pub struct ProverWire {
 }
 
 /// A recorded prover-side constraint.
+///
+/// `Polynomial` dominates both the count (one per asserted circuit
+/// expression) and the size; keeping its coefficients inline — rather than
+/// boxed — is a deliberate trade of enum width for the removal of one heap
+/// allocation, pointer chase, and separate zeroization per constraint.
+#[allow(clippy::large_enum_variant)]
 pub enum ProverConstraint {
     /// A single degree-≤2 relation with QuickSilver coefficients
     /// `(A₀, A₁)`, satisfied exactly by the witness.
@@ -126,7 +204,7 @@ pub enum ProverConstraint {
     /// A deferred quadratic system, folded with challenge randomness.
     System(ProverQuadSystem),
     /// A fully materialized polynomial whose leading coefficient must vanish.
-    Polynomial(Vec<GF2p128>),
+    Polynomial(PolyCoeffs),
 }
 
 impl Zeroize for ProverConstraint {
@@ -143,9 +221,14 @@ impl Zeroize for ProverConstraint {
 }
 
 /// Prover-side polynomial expression, coefficients in low-to-high order.
-#[derive(Clone, Debug)]
+///
+/// Stored inline (no heap allocation): the expression layer runs millions of
+/// times per proof. Degrees above [`MAX_DEGREE`] are unsupported — `prove`
+/// and `verify` reject such circuits via the counting pass before either
+/// cryptographic backend runs.
+#[derive(Clone, Copy, Debug)]
 pub struct ProverExpr {
-    coefficients: Vec<GF2p128>,
+    coefficients: PolyCoeffs,
 }
 
 /// Prover-side stored quadratic system (values and tags of every term).
@@ -232,14 +315,26 @@ impl Drop for ProverBackend<'_> {
 impl<'a> ProverBackend<'a> {
     /// Create a prover backend over the witness bits and the first
     /// `witness.len()` VOLE coordinates.
-    pub fn new(witness: &'a [bool], u: &'a crate::bits::BitVec, tags: &'a [GF2p128]) -> Self {
+    ///
+    /// `constraint_capacity` must be the constraint count reported by the
+    /// [`CountingBackend`] pass over the same circuit. Reserving it up front
+    /// guarantees the constraint vector never reallocates while it holds
+    /// secrets: constraint coefficients are stored inline, so a growth
+    /// reallocation would copy them into a new buffer and free the old one
+    /// unwiped, out of reach of the drop-time zeroization.
+    pub fn new(
+        witness: &'a [bool],
+        u: &'a crate::bits::BitVec,
+        tags: &'a [GF2p128],
+        constraint_capacity: usize,
+    ) -> Self {
         ProverBackend {
             witness,
             u,
             tags,
             next: 0,
             d: Vec::with_capacity(witness.len()),
-            constraints: Vec::new(),
+            constraints: Vec::with_capacity(constraint_capacity),
             satisfied: true,
         }
     }
@@ -330,42 +425,47 @@ impl Backend for ProverBackend<'_> {
     }
 
     fn wire_expr(&mut self, wire: &ProverWire) -> ProverExpr {
-        ProverExpr {
-            coefficients: vec![wire.tag, wire.value],
-        }
+        let mut coefficients = PolyCoeffs::zeroed(2);
+        coefficients.slots[0] = wire.tag;
+        coefficients.slots[1] = wire.value;
+        ProverExpr { coefficients }
     }
 
     fn expr_add(&mut self, a: &ProverExpr, b: &ProverExpr) -> ProverExpr {
         let len = a.coefficients.len().max(b.coefficients.len());
-        let mut coefficients = vec![GF2p128::ZERO; len];
+        let mut coefficients = PolyCoeffs::zeroed(len);
         let a_shift = len - a.coefficients.len();
         let b_shift = len - b.coefficients.len();
-        for (index, coefficient) in a.coefficients.iter().enumerate() {
-            coefficients[a_shift + index] += *coefficient;
+        for (index, coefficient) in a.coefficients.as_slice().iter().enumerate() {
+            coefficients.slots[a_shift + index] += *coefficient;
         }
-        for (index, coefficient) in b.coefficients.iter().enumerate() {
-            coefficients[b_shift + index] += *coefficient;
+        for (index, coefficient) in b.coefficients.as_slice().iter().enumerate() {
+            coefficients.slots[b_shift + index] += *coefficient;
         }
         ProverExpr { coefficients }
     }
 
     fn expr_mul(&mut self, a: &ProverExpr, b: &ProverExpr) -> ProverExpr {
-        let mut coefficients = vec![GF2p128::ZERO; a.coefficients.len() + b.coefficients.len() - 1];
-        for (i, left) in a.coefficients.iter().enumerate() {
-            for (j, right) in b.coefficients.iter().enumerate() {
-                coefficients[i + j] += *left * *right;
+        let len = a.coefficients.len() + b.coefficients.len() - 1;
+        assert!(
+            len <= PolyCoeffs::CAPACITY,
+            "expression degree exceeds MAX_DEGREE ({MAX_DEGREE})"
+        );
+        let mut coefficients = PolyCoeffs::zeroed(len);
+        for (i, left) in a.coefficients.as_slice().iter().enumerate() {
+            for (j, right) in b.coefficients.as_slice().iter().enumerate() {
+                coefficients.slots[i + j] += *left * *right;
             }
         }
         ProverExpr { coefficients }
     }
 
     fn assert_expr_zero(&mut self, expression: &ProverExpr) {
-        if expression.coefficients.last() != Some(&GF2p128::ZERO) {
+        if expression.coefficients.as_slice().last() != Some(&GF2p128::ZERO) {
             self.satisfied = false;
         }
-        self.constraints.push(ProverConstraint::Polynomial(
-            expression.coefficients.clone(),
-        ));
+        self.constraints
+            .push(ProverConstraint::Polynomial(expression.coefficients));
     }
 }
 
@@ -418,6 +518,9 @@ impl VerifierQuadSystem {
 pub struct VerifierBackend<'a> {
     keys: &'a [GF2p128],
     delta: GF2p128,
+    /// `delta_pows[i] = Δ^i`, precomputed for the expression layer's degree
+    /// alignments (a table lookup instead of a `pow` per operation).
+    delta_pows: [GF2p128; MAX_DEGREE + 1],
     next: usize,
     /// Recorded constraints, in emission order.
     pub checks: Vec<VerifierConstraint>,
@@ -427,12 +530,26 @@ impl<'a> VerifierBackend<'a> {
     /// Create a verifier backend over the witness-stage keys (already
     /// adjusted by the public corrections `d`).
     pub fn new(keys: &'a [GF2p128], delta: GF2p128) -> Self {
+        let mut delta_pows = [GF2p128::ONE; MAX_DEGREE + 1];
+        for i in 1..delta_pows.len() {
+            delta_pows[i] = delta_pows[i - 1] * delta;
+        }
         VerifierBackend {
             keys,
             delta,
+            delta_pows,
             next: 0,
             checks: Vec::new(),
         }
+    }
+
+    /// `Δ^exponent`; identical to `delta.pow(exponent)`, via the table for
+    /// the in-range exponents the expression layer produces.
+    fn delta_pow(&self, exponent: usize) -> GF2p128 {
+        self.delta_pows
+            .get(exponent)
+            .copied()
+            .unwrap_or_else(|| self.delta.pow(exponent as u128))
     }
 
     /// Number of witness bits consumed.
@@ -525,8 +642,8 @@ impl Backend for VerifierBackend<'_> {
     fn expr_add(&mut self, a: &VerifierExpr, b: &VerifierExpr) -> VerifierExpr {
         let degree = a.degree.max(b.degree);
         VerifierExpr {
-            evaluation: a.evaluation * self.delta.pow((degree - a.degree) as u128)
-                + b.evaluation * self.delta.pow((degree - b.degree) as u128),
+            evaluation: a.evaluation * self.delta_pow(degree - a.degree)
+                + b.evaluation * self.delta_pow(degree - b.degree),
             degree,
         }
     }
@@ -556,6 +673,13 @@ pub struct CountingBackend {
     pub constraints: usize,
     /// Maximum asserted polynomial degree.
     pub max_degree: usize,
+    /// Maximum degree of any *constructed* expression, asserted or not.
+    /// Proving and verification reject circuits whose built degree exceeds
+    /// [`MAX_DEGREE`] before either cryptographic backend runs, so the
+    /// inline-array expression storage can never overflow. This does not
+    /// affect `max_degree` and therefore does not change VOLE sizing or the
+    /// transcript of any accepted circuit.
+    pub max_built_degree: usize,
 }
 
 impl Backend for CountingBackend {
@@ -597,7 +721,11 @@ impl Backend for CountingBackend {
     }
 
     fn expr_mul(&mut self, a: &usize, b: &usize) -> usize {
-        *a + *b
+        // Saturating: a runaway product chain must pin at the ceiling (and be
+        // rejected by the built-degree check), never wrap back into range.
+        let degree = a.saturating_add(*b);
+        self.max_built_degree = self.max_built_degree.max(degree);
+        degree
     }
 
     fn assert_expr_zero(&mut self, expression: &usize) {
