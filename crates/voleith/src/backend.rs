@@ -229,9 +229,11 @@ impl Backend for ProverBackend<'_> {
     }
 
     fn assert_zero(&mut self, a: &ProverWire) {
-        // key_a = tag_a + value_a·Δ, so B = A₀ + A₁·Δ with A₀ = tag, A₁ = value.
+        // Homogenize to degree 2 (as `a·1 = 0`) so the check is not a
+        // tautology: verifier computes B = Δ·k_a = tag_a·Δ + value_a·Δ², so
+        // (A₀, A₁) = (0, tag_a). A nonzero value leaves an unmatched Δ² term.
         self.constraints
-            .push(ProverConstraint::Simple(a.tag, a.value));
+            .push(ProverConstraint::Simple(GF2p128::ZERO, a.tag));
         if a.value != GF2p128::ZERO {
             self.satisfied = false;
         }
@@ -370,7 +372,9 @@ impl Backend for VerifierBackend<'_> {
     }
 
     fn assert_zero(&mut self, a: &VerifierWire) {
-        self.checks.push(VerifierConstraint::Simple(a.key));
+        // Matches the prover's degree-2 homogenization: B = Δ·k_a.
+        self.checks
+            .push(VerifierConstraint::Simple(self.delta * a.key));
     }
 
     fn assert_mul(&mut self, a: &VerifierWire, b: &VerifierWire, c: &VerifierWire) {

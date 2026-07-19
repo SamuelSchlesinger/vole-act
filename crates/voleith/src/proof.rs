@@ -174,6 +174,21 @@ pub fn prove<C: Circuit>(
     witness: &[bool],
     rng: &mut impl CryptoRngCore,
 ) -> Result<Proof, VoleithError> {
+    prove_impl(params, public_input, circuit, witness, rng, true)
+}
+
+/// Core prover. When `enforce_satisfied` is false the satisfiability check is
+/// skipped and a (necessarily-rejected) proof is produced anyway — used only
+/// by soundness tests that must construct malicious proofs directly.
+pub(crate) fn prove_impl<C: Circuit>(
+    params: &Params,
+    public_input: &[u8],
+    circuit: &C,
+    witness: &[bool],
+    rng: &mut impl CryptoRngCore,
+    enforce_satisfied: bool,
+) -> Result<Proof, VoleithError> {
+    params.validate()?;
     let lambda = params.lambda();
 
     // Size the circuit.
@@ -204,7 +219,7 @@ pub fn prove<C: Circuit>(
     if backend.bits_used() != l {
         return Err(VoleithError::WitnessMismatch);
     }
-    if !backend.satisfied {
+    if enforce_satisfied && !backend.satisfied {
         return Err(VoleithError::Unsatisfiable);
     }
     let mut d = BitVec::zero(l);
@@ -290,6 +305,7 @@ pub fn verify<C: Circuit>(
     circuit: &C,
     proof: &Proof,
 ) -> Result<(), VoleithError> {
+    params.validate()?;
     let lambda = params.lambda();
 
     // Size the circuit and validate proof shape.
@@ -389,4 +405,49 @@ pub fn verify<C: Circuit>(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod soundness_tests {
+    use super::*;
+    use crate::backend::Backend;
+    use crate::vole::PARAMS_128;
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
+
+    /// A circuit that asserts a single witness bit is zero. With a witness
+    /// bit of 1 the statement is false; an honest prover would refuse, but a
+    /// malicious one (via `prove_impl(.., false)`) still emits a proof — the
+    /// verifier MUST reject it. This is the regression test for the
+    /// `assert_zero`-not-enforced bug (Codex S5).
+    struct AssertBitZero;
+
+    impl Circuit for AssertBitZero {
+        fn build<B: Backend>(&self, backend: &mut B) -> Result<(), VoleithError> {
+            let b = backend.witness_bit()?;
+            backend.assert_zero(&b);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn false_linear_assertion_is_rejected() {
+        let mut rng = StdRng::seed_from_u64(100);
+        // Honest witness (bit = 0) verifies.
+        let ok = prove_impl(&PARAMS_128, b"az", &AssertBitZero, &[false], &mut rng, true).unwrap();
+        verify(&PARAMS_128, b"az", &AssertBitZero, &ok).unwrap();
+
+        // Malicious proof over a false statement (bit = 1) must be rejected
+        // by the verifier, across many transcripts (no lucky Δ).
+        for seed in 0..40u64 {
+            let mut rng = StdRng::seed_from_u64(1000 + seed);
+            let bad =
+                prove_impl(&PARAMS_128, b"az", &AssertBitZero, &[true], &mut rng, false).unwrap();
+            assert_eq!(
+                verify(&PARAMS_128, b"az", &AssertBitZero, &bad),
+                Err(VoleithError::InvalidProof),
+                "false assert_zero accepted at seed {seed}"
+            );
+        }
+    }
 }

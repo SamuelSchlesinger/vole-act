@@ -46,6 +46,17 @@ impl Params {
     pub const fn leaves(&self) -> usize {
         1 << self.k
     }
+
+    /// Reject unsupported parameters *before* any cryptographic work, so
+    /// attacker-supplied dimensions cannot trigger panics (out-of-range
+    /// shifts) instead of clean errors. Only λ = 128 is supported, with a
+    /// per-tree chunk that fits the field's bit width.
+    pub(crate) fn validate(&self) -> Result<(), crate::VoleithError> {
+        let ok =
+            self.tau >= 1 && self.k >= 1 && self.k <= 24 && self.tau <= 128 && self.lambda() == 128;
+        ok.then_some(())
+            .ok_or(crate::VoleithError::InvalidParameters)
+    }
 }
 
 /// Derive the salt for tree `j`'s internal vector-commitment hashing.
