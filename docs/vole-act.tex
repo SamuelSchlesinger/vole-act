@@ -803,11 +803,13 @@ and underlies the FAEST signature candidate~\cite{FAEST}, whose engineering
 \cite{OneTree}. MAYO~\cite{Beullens21,MAYOspec} descends from unbalanced
 oil-and-vinegar~\cite{UOV}; \cite{Beullens22} is the cautionary tale for the
 assumption class. The closest post-quantum
-relative is PoMFRIT~\cite{PoMFRIT}, which likewise combines
-VOLE-in-the-Head proofs of SHA-3-family circuits with the MAYO trapdoor and
-analyzes the stronger one-more-preimage property such issuers require; the
-constructions differ in functionality (VOLE-ACT's stateful balances, typed
-settlement, and deferred returns). Anonymous tokens and credentials span
+relative is PoMFRIT~\cite{PoMFRIT}, a \emph{blind-signature} scheme that
+likewise combines VOLE-in-the-Head proofs of SHA-3-family circuits with the
+MAYO trapdoor and analyzes the one-more-preimage property such issuers
+require --- an instructive contrast: PoMFRIT pursues the blindness route
+with the same toolbox, while VOLE-ACT's commit-then-sign design avoids
+blindness and adds stateful balances, typed settlement, and deferred
+returns. Anonymous tokens and credentials span
 blind signatures~\cite{Chaum82}, CL signatures~\cite{CL01},
 keyed-verification credentials from algebraic MACs~\cite{CMZ14}, and
 deployed unit-token systems~\cite{PrivacyPass}; VOLE-ACT is a post-quantum
@@ -942,10 +944,10 @@ A.~Davidson, I.~Goldberg, N.~Sullivan, G.~Tankersley, F.~Valsorda.
 Proceedings on Privacy Enhancing Technologies 2018(3), 164--180.
 
 \bibitem{PoMFRIT}
-C.~Baum et al.
-\emph{PoMFRIT}.
+C.~Baum, M.~Beckmann, W.~Beullens, S.~Mukherjee, C.~Rechberger.
+\emph{Concretely Efficient Blind Signatures Based on VOLE-in-the-Head
+Proofs and the MAYO Trapdoor (PoMFRIT)}.
 USENIX Security 2026. IACR ePrint 2026/109.
-% verify full author list and title against the ePrint entry
 
 \bibitem{KS}
 J.~Katz, S.~Schlesinger.
