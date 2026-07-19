@@ -6,6 +6,7 @@
 \usepackage{microtype}
 \usepackage{xcolor}
 \definecolor{linkblue}{RGB}{25,60,120}
+\usepackage[operators]{cryptocode}
 \usepackage[colorlinks=true,linkcolor=linkblue,citecolor=linkblue,urlcolor=linkblue]{hyperref}
 
 \newtheorem{definition}{Definition}
@@ -310,32 +311,66 @@ distinct nullifiers, and exact retransmission of a request returns the
 stored response rather than a new node.
 \end{definition}
 
-\begin{definition}[Fiscal soundness game]
+\begin{definition}[Fiscal soundness]
 \label{def:fiscal}
-The adversary $\adv$ controls all clients and interacts, over the whole
-experiment, with an honest issuer through three oracles:
-$\mathsf{ISSUE}(b)$, whose accepted calls are externally authorized and
-record $b$; $\mathsf{SPEND}(\cdot)$; and $\mathsf{SPENDDEF}(\cdot, t')$,
-where $\adv$ names the desired return and the oracle enforces $t' \le s$
-and reports the applied $t'$ in its output (in the real system $t'$ is
-issuer policy; letting $\adv$ choose it is conservative). Rejected calls
-record nothing, and accounting is per \emph{logical spend event}: each
-first durable consumption of a nullifier creates one record, an exact
-retransmission of the same request contributes zero additional redemption
-and returns the originally recorded response (including the original
-$t'$), and conflicting reuse of a consumed nullifier is rejected. External
-redemption of value must be idempotent at the same boundary. Define the
-\emph{net redeemed value} of a logical ordinary spend of public amount $s$
-as $s$, and of a logical deferred spend as $s - t'$. $\adv$ wins if at any
-point during the experiment
-\[
-\sum_{\text{accepted spends}} \text{net redeemed value}
-\;>\;
-\sum_{\text{accepted issuances}} b .
-\]
-The scheme is fiscally sound if every efficient $\adv$ wins with negligible
-probability.
+For a scheme $\Pi$ and adversary $\adv$, the experiment
+$\mathrm{Exp}^{\mathrm{fiscal}}_{\Pi,\adv}(\lambda)$ of
+Figure~\ref{fig:fiscal} runs $\adv$ as all clients against an honest
+issuer. $\Pi$ is \emph{fiscally sound} if for every efficient $\adv$,
+$\mathrm{Adv}^{\mathrm{fiscal}}_{\Pi,\adv}(\lambda) :=
+\Pr[\mathrm{Exp}^{\mathrm{fiscal}}_{\Pi,\adv}(\lambda) = 1]$
+is negligible.
 \end{definition}
+
+\begin{figure}[t]
+\centering
+\begin{pcvstack}[boxed]
+\procedure{$\mathrm{Exp}^{\mathrm{fiscal}}_{\Pi,\adv}(\lambda)$}{%
+ (\mathsf{sk}, \mathsf{pk}, \ctx) \sample \mathsf{Setup}(1^\lambda,
+   \mathsf{app}) \\
+ I \gets 0; \quad R \gets 0; \quad \mathsf{St} \gets \emptyset; \quad
+   \mathsf{win} \gets 0 \\
+ \text{run } \adv^{\mathsf{oIssue}, \mathsf{oSpend},
+   \mathsf{oSpendDef}}(\mathsf{pk}, \ctx) \\
+ \pcreturn \mathsf{win}}
+\pcvspace
+\procedure{$\mathsf{oIssue}(b)$}{%
+ \text{run the issuer side of } \mathsf{Issue}
+   \text{ at balance } b \text{ with } \adv \text{ as client} \\
+ \pcif \text{the issuer accepts:} \quad
+   I \gets I + b; \; \pcreturn \text{its response} \\
+ \pcreturn \bot}
+\pcvspace
+\procedure{$\mathsf{oSpend}(\mathit{req})
+  \quad \pccomment{req carries nullifier $\Null$, amount $s$; let
+  $\mathit{dig} = \mathsf{digest}(\ctx, \mathit{req})$}$}{%
+ \pcif \mathsf{St}[\Null] = (\mathit{dig}', \mathit{resp}')
+   \text{ exists:} \\
+ \pcind \pcif \mathit{dig}' = \mathit{dig}: \pcreturn \mathit{resp}'
+   \quad \pccomment{exact retry: no accounting change} \\
+ \pcind \pcreturn \bot
+   \quad \pccomment{conflicting reuse of a consumed nullifier} \\
+ \pcif \text{issuer verification of } \mathit{req} \text{ fails:}
+   \pcreturn \bot \\
+ \mathit{resp} \gets \text{issuer response (fresh preimage on the fresh
+   target)} \\
+ \mathsf{St}[\Null] \gets (\mathit{dig}, \mathit{resp}); \quad
+   R \gets R + s \\
+ \pcif R > I: \mathsf{win} \gets 1 \\
+ \pcreturn \mathit{resp}}
+\pcvspace
+\procedure{$\mathsf{oSpendDef}(\mathit{req}, t')$}{%
+ \text{as } \mathsf{oSpend}, \text{ except: require } t' \le s;\;
+   \mathit{resp} \text{ records } t';\; R \gets R + s - t' \\
+ \pccomment{an exact retry replays the stored response, including the
+   original $t'$}}
+\end{pcvstack}
+\caption{The fiscal-soundness experiment. Accounting is per logical spend
+event (first durable consumption of a nullifier); letting $\adv$ choose
+$t' \le s$ models issuer return policy conservatively. External redemption
+of value must be idempotent at the same store boundary.}
+\label{fig:fiscal}
+\end{figure}
 
 \begin{remark}[Redemption-only is without loss of generality]
 The win condition counts only \emph{redeemed} value, not outstanding
@@ -350,31 +385,67 @@ up to this cash-out reduction, which is the statement a full analysis
 should prove as a lemma rather than assume.
 \end{remark}
 
-\begin{definition}[Spend anonymity game, single challenge]
+\begin{definition}[Spend anonymity, single challenge]
 \label{def:anon}
-The adversary $\adv$ plays a malicious issuer. It first outputs arbitrary
-public-key bytes; the challenger parses and validates them with the
-scheme's canonical decoder (the game proceeds only on a valid parse) and
-recomputes $\ctx$ itself exactly as $\mathsf{Setup}$ prescribes; the key
-and context are fixed for the remainder of the game. The challenger then
-operates honest clients, which perform every client-side authentication
-check and abort on failure; $\adv$ executes the issuer side of all
-sessions, sees all transcripts, and may abort any session (an aborted
-session yields no token).
+For a scheme $\Pi$ and adversary $\adv$ (a malicious issuer), the
+experiment $\mathrm{Exp}^{\mathrm{anon}}_{\Pi,\adv}(\lambda)$ of
+Figure~\ref{fig:anon} is defined with the convention that an aborting run
+outputs a uniformly random bit, so degenerate strategies gain nothing.
+$\Pi$ is \emph{spend-anonymous} if for every efficient $\adv$,
+$\mathrm{Adv}^{\mathrm{anon}}_{\Pi,\adv}(\lambda) :=
+\bigl|\Pr[\mathrm{Exp}^{\mathrm{anon}}_{\Pi,\adv}(\lambda) = 1] -
+\tfrac{1}{2}\bigr|$ is negligible.
+\end{definition}
 
-$\adv$ directs the creation of honest tokens through arbitrary
-issuance/spend histories, then designates two \emph{authenticated, unspent}
-tokens $T_0, T_1$ of the same credential kind and \emph{equal effective
-balance}, and a challenge: a spend of public amount $s$ valid for both,
-with a fixed settlement mode. The challenger executes the challenge on
-$T_\beta$ for $\beta \gets \{0,1\}$ and hands $\adv$ the transcript
-(including issuer-visible aborts, which $\adv$ may induce). Thereafter
-$T_0$, $T_1$, and the challenge's successor token are \emph{retired}: no
-further oracle use, by either party, involves them. $\adv$ may continue
-directing operations on unrelated tokens, then outputs $\beta'$ and wins
-if $\beta' = \beta$; the scheme is spend-anonymous if
-$|\Pr[\beta' = \beta] - 1/2|$ is negligible.
+\begin{figure}[t]
+\centering
+\begin{pcvstack}[boxed]
+\procedure{$\mathrm{Exp}^{\mathrm{anon}}_{\Pi,\adv}(\lambda)$}{%
+ \beta \sample \{0,1\}; \quad \mathcal{T} \gets \emptyset
+   \quad \pccomment{handle table of honest tokens} \\
+ \mathsf{pk}_{\mathrm{bytes}} \sample \adv(1^\lambda) \\
+ \mathsf{pk} \gets \mathsf{CanonParse}(\mathsf{pk}_{\mathrm{bytes}});
+   \quad \pcif \mathsf{pk} = \bot: \text{abort} \\
+ \ctx \gets \mathsf{DeriveCtx}(\mathsf{pk})
+   \quad \pccomment{as in $\mathsf{Setup}$; fixed hereafter} \\
+ (h_0, h_1, s, \mathsf{mode}) \sample \adv^{\mathsf{oClientOp}}() \\
+ \pcif \neg\mathsf{ValidChallenge}(h_0, h_1, s, \mathsf{mode}):
+   \text{abort} \\
+ \text{run the honest client side of the mode-}\mathsf{mode}
+   \text{ spend of amount } s \text{ on } \mathcal{T}[h_\beta], \\
+ \pcind \text{with } \adv \text{ as issuer; } \adv \text{ sees the
+   transcript (including any abort it induces);} \\
+ \pcind \text{on acceptance store the successor at fresh handle }
+   h^\ast \\
+ \mathsf{retire}(h_0); \; \mathsf{retire}(h_1); \;
+   \mathsf{retire}(h^\ast) \\
+ \beta' \sample \adv^{\mathsf{oClientOp}}() \\
+ \pcreturn [\beta' = \beta]}
+\pcvspace
+\procedure{$\mathsf{oClientOp}(\mathsf{op}, h, \mathit{args})$}{%
+ \text{run the honest client side of } \mathsf{op} \in
+   \{\mathsf{Issue}, \mathsf{Spend}, \mathsf{SpendDeferred}\} \\
+ \pcind \text{on the (unretired) token } \mathcal{T}[h] \text{ where
+   required, with } \adv \text{ as issuer,} \\
+ \pcind \text{performing every client-side authentication check} \\
+ \pcif \text{the session accepts: store any output token at a fresh
+   handle; } \pcreturn \text{it} \\
+ \pcreturn \bot \quad \pccomment{aborted sessions yield no token}}
+\pcvspace
+\procedure{$\mathsf{ValidChallenge}(h_0, h_1, s, \mathsf{mode})$}{%
+ \pcreturn h_0 \ne h_1 \;\wedge\; \mathcal{T}[h_0], \mathcal{T}[h_1]
+   \text{ exist, unretired, authenticated, unspent} \\
+ \pcind \wedge\; \text{same credential kind} \;\wedge\;
+   \mathsf{bal}(\mathcal{T}[h_0]) = \mathsf{bal}(\mathcal{T}[h_1])
+   \;\wedge\; s \text{ valid for both}}
+\end{pcvstack}
+\caption{The single-challenge spend-anonymity experiment against a
+malicious issuer. ``Abort'' outputs a uniformly random bit.}
+\label{fig:anon}
+\end{figure}
 
+\begin{remark}[Design of the anonymity game]
+\label{rem:anon}
 The same-kind, same-mode, same-amount, equal-balance restrictions reflect
 leakage the syntax makes public by design. Retiring the \emph{candidates}
 closes the immediate distinguisher: replaying a candidate would reveal
@@ -386,48 +457,78 @@ about continued use. A chain definition (hidden, permuted token handles
 with identical admissible continuations) is the natural strengthening and
 is left open. Section~\ref{sec:security} discusses the metadata any
 deployment leaks outside this game.
-\end{definition}
+\end{remark}
 
-\begin{assumption}[Adaptive one-more preimage for whipped MAYO,
-semi-formal]
+\begin{assumption}[Adaptive one-more preimage for whipped MAYO]
 \label{ass:omp}
-Let $(\mathsf{sk}, \mathsf{pk})$ be a MAYO key pair with whipped public map
-$P^\ast$, and model $\shake$ as an ideal XOF to which the adversary makes
-at most $Q_H$ (classical) queries. Call $y \in \Fsixteen^m$ an
-\emph{admissible target with opening $w$} if either
-(i) $y = \Cred(\kappa,b,\rho)$ with $w = (\kappa,b,\rho)$, or
-(ii) $y = \Def(\ctx, \Cred(\kappa,b,\rho), t)$ with
-$w = (\kappa,b,\rho,t)$ --- the two target languages the protocol signs,
-under their respective domain tags. The adversary receives $\mathsf{pk}$
-and adaptive (classical) access to an oracle that, given an admissible
-target \emph{together with a valid opening}, returns an independently
-sampled $\Spre(\mathsf{sk}, y)$; this mirrors the protocol, where the
-issuer inverts only targets accompanied by a verified proof of opening
-knowledge, and \emph{resamples} on repeated requests (only exact spend
-retransmissions are answered from a cache, which the game models as no
-query at all; preimages the issuer samples but discards after losing an
-insertion race never leave the issuer and are not oracle replies). Let
-$Q_S$ bound the total number of oracle calls and let $d \le Q_S$ be the
-number of \emph{distinct} targets queried --- repeated calls on one target
-consume $Q_S$ budget and yield fresh independent preimages, but do not
-increase $d$. The adversary must output $d+1$ triples
-$(y_j, w_j, \sigma_j)$ with the $y_j$ pairwise distinct admissible
-targets, $w_j$ valid openings, and $P^\ast(\sigma_j) = y_j$. The
-assumption is that every efficient adversary succeeds with probability
-negligible in $\lambda$ (as a function of $Q_S$ and $Q_H$). Counting
-distinct targets is essential: charging every call against the success
-threshold would let $r$ resamplings of one target excuse a single forged
-new target, which already violates fiscal soundness.
+For an adversary $\adv$ making at most $Q_H$ (classical) queries to the
+ideal XOF $\mathcal{H}$ and at most $Q_S$ calls to $\mathsf{oInv}$, the
+experiment $\mathrm{Exp}^{\mathrm{omp}}_{\adv}(\lambda)$ of
+Figure~\ref{fig:omp} is defined over the two admissible target languages
+the protocol signs. The assumption is that for every efficient $\adv$,
+$\mathrm{Adv}^{\mathrm{omp}}_{\adv}(\lambda) :=
+\Pr[\mathrm{Exp}^{\mathrm{omp}}_{\adv}(\lambda) = 1]$ is negligible (as a
+function of $Q_S$ and $Q_H$).
+\end{assumption}
 
-This is stronger and less studied than MAYO's signature unforgeability ---
-the issuer here \emph{is} a preimage oracle. PoMFRIT~\cite{PoMFRIT}
-formalizes an $(n,q)$ variant with $n$ \emph{random} targets, at most $q$
-inversion calls, and $q+1$ distinct target indices for success; bridging
-that game
+\begin{figure}[t]
+\centering
+\begin{pcvstack}[boxed]
+\procedure{$\mathrm{Exp}^{\mathrm{omp}}_{\adv}(\lambda)$}{%
+ (\mathsf{sk}, \mathsf{pk}) \sample \mathsf{KGen}(1^\lambda); \quad
+   \ctx \gets \mathsf{DeriveCtx}(\mathsf{pk}); \quad
+   \mathcal{D} \gets \emptyset \\
+ \{(y_j, w_j, \sigma_j)\}_{j=1}^{k} \sample
+   \adv^{\mathcal{H}, \mathsf{oInv}}(\mathsf{pk}) \\
+ \pcreturn 1 \text{ iff } k \ge |\mathcal{D}| + 1
+   \;\wedge\; y_1, \dots, y_k \text{ pairwise distinct} \\
+ \pcind \wedge\; \forall j: \mathsf{Adm}(y_j, w_j) = 1
+   \;\wedge\; P^\ast(\sigma_j) = y_j}
+\pcvspace
+\begin{pchstack}
+\procedure{$\mathsf{oInv}(y, w)$}{%
+ \pcif \mathsf{Adm}(y, w) = 0: \pcreturn \bot \\
+ \mathcal{D} \gets \mathcal{D} \cup \{y\} \\
+ \pcreturn \Spre(\mathsf{sk}, y) \\
+ \pccomment{fresh randomness per call}}
+\pchspace
+\procedure{$\mathsf{Adm}(y, w)$}{%
+ \pcif w = (\kappa, b, \rho) \wedge y = \Cred(\kappa, b, \rho):
+   \pcreturn 1 \\
+ \pcif w = (\kappa, b, \rho, t) \\
+ \pcind \wedge\; y = \Def(\ctx, \Cred(\kappa, b, \rho), t):
+   \pcreturn 1 \\
+ \pcreturn 0}
+\end{pchstack}
+\end{pcvstack}
+\caption{The adaptive one-more-preimage experiment. $\mathcal{H}$ is the
+ideal (prefix-consistent) XOF; $\Cred$ and $\Def$ are the credential and
+deferred target maps under their domain tags. Success requires
+$|\mathcal{D}| + 1$ pairwise-distinct admissible targets, where
+$\mathcal{D}$ is the set of \emph{distinct} queried targets; the total
+call budget $Q_S \ge |\mathcal{D}|$ enters only concrete bounds.}
+\label{fig:omp}
+\end{figure}
+
+\begin{remark}[Modeling choices in Assumption~\ref{ass:omp}]
+\label{rem:omp}
+The opening-accompanied oracle mirrors the protocol, where the issuer
+inverts only targets carrying a verified proof of opening knowledge, and
+\emph{resamples} on repeated requests: only exact spend retransmissions
+are answered from a cache, which the game models as no query at all, and
+preimages the issuer samples but discards after losing an insertion race
+never leave the issuer and are not oracle replies. Counting
+\emph{distinct} targets in the success threshold is essential: charging
+every call would let $r$ resamplings of one target excuse a single forged
+new target, which already violates fiscal soundness. The assumption is
+stronger and less studied than MAYO's signature unforgeability --- the
+issuer here \emph{is} a preimage oracle. PoMFRIT~\cite{PoMFRIT} formalizes
+an $(n,q)$ variant with $n$ \emph{random} targets, at most $q$ inversion
+calls, and $q+1$ distinct target indices for success; bridging that game
 to the adaptive, opening-accompanied, two-language version above (and
 stating a QROM variant with quantum XOF access) is part of the outstanding
 analysis, not a citation we inherit.
-\end{assumption}
+\end{remark}
 
 \begin{remark}[Hash modeling and adversary class]
 \label{rem:xof}
