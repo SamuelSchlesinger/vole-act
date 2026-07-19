@@ -1,0 +1,16 @@
+[package]
+name = "mayo"
+description = "The MAYO trapdoor function (TrapGen/SPre/Eval) over GF(16)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+binary-fields = { workspace = true }
+rand_core = { workspace = true }
+
+[dev-dependencies]
+rand = "0.8"
+
+[lints]
+workspace = true

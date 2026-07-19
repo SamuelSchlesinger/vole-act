@@ -4,6 +4,7 @@ members = [
     "crates/binary-fields",
     "crates/vector-commit",
     "crates/voleith",
+    "crates/mayo",
     "crates/vole-act",
 ]
 
@@ -17,6 +18,7 @@ license = "MIT OR Apache-2.0"
 binary-fields = { path = "crates/binary-fields" }
 vector-commit = { path = "crates/vector-commit" }
 voleith = { path = "crates/voleith" }
+mayo = { path = "crates/mayo" }
 
 # External
 rand_core = "0.6.4"
@@ -43,6 +45,9 @@ opt-level = 3
 opt-level = 3
 
 [profile.dev.package.voleith]
+opt-level = 3
+
+[profile.dev.package.mayo]
 opt-level = 3
 
 [profile.bench]
