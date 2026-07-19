@@ -58,7 +58,8 @@ whipped MQ verification --- and a security analysis that states its
 assumptions (an adaptive one-more-preimage property of the whipped map; an
 ideal-XOF model) and its concrete attack ceilings explicitly. A Rust
 research prototype achieves 19--20\,ms proving and 6.5--8\,ms issuer
-verification per spend with 53\,KiB proofs and 283-byte tokens.
+verify-and-sign (proof verification plus MAYO preimage sampling) per spend,
+with 53\,KiB proofs and 283-byte tokens.
 \end{abstract}
 
 \section{Introduction}
@@ -151,7 +152,7 @@ ceilings --- including a $2^{256/3}$-query quantum collision bound on the
 credential digest.
 (5)~Evidence of practicality: a Rust research prototype
 (Section~\ref{sec:performance}) with 19--20\,ms spend proving, 6.5--8\,ms
-issuer verification, 53\,KiB compact proofs, and 283-byte tokens.
+issuer verify-and-sign, 53\,KiB compact proofs, and 283-byte tokens.
 
 \section{Preliminaries}
 
@@ -311,69 +312,120 @@ stored response rather than a new node.
 
 \begin{definition}[Fiscal soundness game]
 \label{def:fiscal}
-The adversary $\adv$ controls all clients and interacts with an honest
-issuer through its three oracles: $\mathsf{ISSUE}(b)$ (each call is
-externally authorized and records $b$), $\mathsf{SPEND}(\cdot)$, and
-$\mathsf{SPENDDEF}(\cdot, t')$ with issuer-chosen returns $t' \le s$.
-Define the \emph{net redeemed value} of an accepted ordinary spend of public
-amount $s$ as $s$, and of an accepted deferred spend as $s - t'$. $\adv$
-wins if at any point
+The adversary $\adv$ controls all clients and interacts, over the whole
+experiment, with an honest issuer through three oracles:
+$\mathsf{ISSUE}(b)$, whose accepted calls are externally authorized and
+record $b$; $\mathsf{SPEND}(\cdot)$; and $\mathsf{SPENDDEF}(\cdot, t')$,
+where $\adv$ names the desired return and the oracle enforces $t' \le s$
+and reports the applied $t'$ in its output (in the real system $t'$ is
+issuer policy; letting $\adv$ choose it is conservative). Rejected calls
+record nothing. Define the \emph{net redeemed value} of an accepted
+ordinary spend of public amount $s$ as $s$, and of an accepted deferred
+spend as $s - t'$. $\adv$ wins if at any point during the experiment
 \[
 \sum_{\text{accepted spends}} \text{net redeemed value}
 \;>\;
-\sum_{\text{issuances}} b .
+\sum_{\text{accepted issuances}} b .
 \]
 The scheme is fiscally sound if every efficient $\adv$ wins with negligible
-probability. (This win condition implies the ledger invariant of the design
-document: over-redemption is exactly what it forbids; double-spending a
-token is one way to attempt it.)
+probability.
 \end{definition}
 
-\begin{definition}[Spend anonymity game]
+\begin{remark}[Redemption-only is without loss of generality]
+The win condition counts only \emph{redeemed} value, not outstanding
+spendable balances, so an attack that merely \emph{forks} a token into two
+live successors has not yet won. It extends to a win at will: any
+adversary holding more spendable value than the invariant allows simply
+continues querying $\mathsf{SPEND}$ to cash the excess out, and the game
+runs for the whole experiment. Formally, redemption-only soundness is
+equivalent to the ledger invariant of the design document
+(redeemed value $+$ live independently spendable value $\le$ issued value)
+up to this cash-out reduction, which is the statement a full analysis
+should prove as a lemma rather than assume.
+\end{remark}
+
+\begin{definition}[Spend anonymity game, single challenge]
 \label{def:anon}
-The adversary $\adv$ plays a malicious issuer: it supplies the public key
-material, executes the issuer side of all sessions, and sees all
-transcripts. The challenger operates honest clients. $\adv$ directs the
-creation of two unspent honest tokens $T_0, T_1$ (through arbitrary honest
-issuance/spend histories of its choice), then names a challenge operation:
-a spend of public amount $s$ valid for both tokens, with both tokens of the
-same credential kind and the same settlement mode. The challenger executes
-the challenge on $T_\beta$ for $\beta \gets \{0,1\}$, and continues
-operating the unchallenged token honestly if directed. $\adv$ outputs
-$\beta'$ and wins if $\beta' = \beta$; the scheme is spend-anonymous if
+The adversary $\adv$ plays a malicious issuer. It first outputs arbitrary
+public-key bytes; the challenger parses and validates them with the
+scheme's canonical decoder (the game proceeds only on a valid parse) and
+recomputes $\ctx$ itself exactly as $\mathsf{Setup}$ prescribes; the key
+and context are fixed for the remainder of the game. The challenger then
+operates honest clients, which perform every client-side authentication
+check and abort on failure; $\adv$ executes the issuer side of all
+sessions, sees all transcripts, and may abort any session (an aborted
+session yields no token).
+
+$\adv$ directs the creation of honest tokens through arbitrary
+issuance/spend histories, then designates two \emph{authenticated, unspent}
+tokens $T_0, T_1$ of the same credential kind and \emph{equal effective
+balance}, and a challenge: a spend of public amount $s$ valid for both,
+with a fixed settlement mode. The challenger executes the challenge on
+$T_\beta$ for $\beta \gets \{0,1\}$ and hands $\adv$ the transcript
+(including issuer-visible aborts, which $\adv$ may induce). Thereafter
+$T_0$, $T_1$, and the challenge's successor token are \emph{retired}: no
+further oracle use, by either party, involves them. $\adv$ may continue
+directing operations on unrelated tokens, then outputs $\beta'$ and wins
+if $\beta' = \beta$; the scheme is spend-anonymous if
 $|\Pr[\beta' = \beta] - 1/2|$ is negligible.
 
-The same-kind, same-mode, same-amount restrictions reflect leakage the
-syntax makes public by design; Section~\ref{sec:security} discusses the
-further metadata (sizes, timing, network identity) that any deployment
-leaks outside this game. A stronger definition quantifying over entire
-spend \emph{chains} is the natural extension and is left open.
+The same-kind, same-mode, same-amount, equal-balance restrictions reflect
+leakage the syntax makes public by design, and retiring the candidates and
+successor confines the definition to a single challenged spend ---
+without retirement, replaying a candidate would reveal $\beta$ through
+nullifier reuse, and the successors' differing balances would leak through
+follow-up amounts. A chain definition (hidden, permuted token handles with
+identical admissible continuations) is the natural strengthening and is
+left open. Section~\ref{sec:security} discusses the metadata any
+deployment leaks outside this game.
 \end{definition}
 
-\begin{assumption}[Adaptive one-more preimage for whipped MAYO]
+\begin{assumption}[Adaptive one-more preimage for whipped MAYO,
+semi-formal]
 \label{ass:omp}
 Let $(\mathsf{sk}, \mathsf{pk})$ be a MAYO key pair with whipped public map
-$P^\ast$. The adversary receives $\mathsf{pk}$ and adaptive access to a
-preimage oracle $\Spre(\mathsf{sk}, \cdot)$; targets are restricted to the
-hash-shaped distribution the protocol produces (outputs of the ideal XOF on
-adversarially chosen inputs). After $q$ oracle queries the adversary must
-output $q+1$ pairs $(y_j, \sigma_j)$ with $P^\ast(\sigma_j) = y_j$, the
-$y_j$ distinct and each accompanied by an XOF opening. The assumption is
-that every efficient adversary succeeds with negligible probability.
+$P^\ast$, and model $\shake$ as an ideal XOF to which the adversary makes
+at most $Q_H$ (classical) queries. Call $y \in \Fsixteen^m$ an
+\emph{admissible target with opening $w$} if either
+(i) $y = \Cred(\kappa,b,\rho)$ with $w = (\kappa,b,\rho)$, or
+(ii) $y = \Def(\ctx, \Cred(\kappa,b,\rho), t)$ with
+$w = (\kappa,b,\rho,t)$ --- the two target languages the protocol signs,
+under their respective domain tags. The adversary receives $\mathsf{pk}$
+and adaptive (classical) access to an oracle that, given an admissible
+target \emph{together with a valid opening}, returns
+$\Spre(\mathsf{sk}, y)$; this mirrors the protocol, where the issuer
+inverts only targets accompanied by a verified proof of opening knowledge.
+Repeated queries on the same target count once. After $q$ oracle queries
+the adversary must output $q+1$ triples $(y_j, w_j, \sigma_j)$ with the
+$y_j$ pairwise distinct admissible targets, $w_j$ valid openings, and
+$P^\ast(\sigma_j) = y_j$. The assumption is that every efficient adversary
+succeeds with probability negligible in $\lambda$ (as a function of $q$
+and $Q_H$).
+
 This is stronger and less studied than MAYO's signature unforgeability ---
-the issuer here \emph{is} a preimage oracle --- and its precise formulation
-(in particular the target distribution) is part of the outstanding
-analysis; PoMFRIT~\cite{PoMFRIT} treats the analogous property directly.
+the issuer here \emph{is} a preimage oracle. PoMFRIT~\cite{PoMFRIT}
+formalizes an $(n,q)$ variant with $n$ \emph{random} targets and at most
+$q$ inversions; bridging that game to the adaptive, opening-accompanied,
+two-language version above (and stating a QROM variant with quantum XOF
+access) is part of the outstanding analysis, not a citation we inherit.
 \end{assumption}
 
-\begin{remark}[Hash modeling]
+\begin{remark}[Hash modeling and adversary class]
 \label{rem:xof}
-The analysis models $\shake$ as an ideal XOF (equivalently, a random oracle
-with variable-length output) for three distinct roles: the credential
-stream (hiding, collision and preimage structure, suffix pseudorandomness
-given a prefix), the GGM/vector-commitment PRG layer, and Fiat--Shamir.
-FIPS~202 standardizes SHAKE but proves none of these properties; sponge
-indifferentiability results are the standard heuristic bridge.
+The analysis models $\shake$ as an ideal XOF --- a \emph{prefix-consistent}
+variable-output random oracle, so that reading $4m{+}256$ bits and reading
+$4m$ bits of the same stream agree on their common prefix (ordinary
+length-indexed random-oracle outputs do not automatically provide this) ---
+for three distinct roles: the credential stream (hiding, collision and
+preimage structure, suffix pseudorandomness given a prefix), the
+GGM/vector-commitment PRG layer, and Fiat--Shamir. FIPS~202 standardizes
+SHAKE but proves none of these properties; sponge indifferentiability is
+the standard heuristic bridge. The claims of
+Section~\ref{sec:security} target \emph{classical} PPT adversaries in this
+ROM; the primitives are post-quantum candidates, but a QROM treatment
+(quantum XOF access, quantum rewinding for extraction) is explicitly open,
+so ``post-quantum'' describes the assumption class, not a proved quantum
+security level.
 \end{remark}
 
 \section{The VOLE-ACT construction}
@@ -425,7 +477,59 @@ return were known in advance, the client would simply spend less. All four
 transitions carry distinct domain-separation tags end-to-end, so mode
 confusion at the byte level cannot create an untyped path.
 
+\subsection{Algorithms}
+\label{sec:algorithms}
+
+Figure~\ref{fig:algorithms} instantiates Definition~\ref{def:syntax}.
+$\mathsf{pack16}$ packs a $\Fsixteen$-vector two nibbles per byte, first
+element in the low nibble; all domain tags are ASCII strings under
+prefix-free framing; $\Pi.\mathsf{Prove}/\mathsf{Verify}$ is the VOLEitH
+argument of Section~\ref{sec:circuit} for the stated relation, with the
+statement (all public values, tags, and $\ctx$) bound into Fiat--Shamir.
+
+\begin{figure}[t]
+\small
+\begin{itemize}
+  \item $\mathsf{Setup}(1^\lambda, \mathsf{app})$: run MAYO trapdoor
+  generation for the chosen parameter set; expand the whipped forms; set
+  $\ctx \gets \shake(\text{``context''} \,\|\, \mathsf{frame}(\mathsf{app})
+  \,\|\, H(\text{expanded } P^\ast) \,\|\, \text{parameter and profile
+  identifiers} \,\|\, \text{balance width})[0{:}256]$. Output
+  $(\mathsf{sk}, \mathsf{pk}, \ctx)$.
+  \item $\mathsf{Issue}$, client with $(\mathsf{pk}, b)$: sample
+  $\kappa, \rho \gets \{0,1\}^{256}$; compute $\Cred$ from the credential
+  stream; send $(b, \Cred, \pi)$ where $\pi \gets \Pi.\mathsf{Prove}$ for
+  the relation $\Cred = \Cred(\kappa,b,\rho)$ with public $(b, \Cred,
+  \ctx)$. Issuer: verify $\pi$ (and external authorization); return
+  $\sigma \gets \Spre(\mathsf{sk}, \Cred)$. Client: accept the direct
+  token $T = (\sigma, \kappa, b, \rho)$ iff $P^\ast(\sigma) = \Cred$.
+  \item $\mathsf{Spend}$, client with $(\mathsf{pk}, T, s)$: sample fresh
+  $(\kappa', \rho')$, set $b' = \mathsf{bal}(T) - s$, compute $\Cred'$ and
+  $\Null$ from $T$'s stream; send $(s, \Null, \Cred', \pi)$ for the spend
+  relation of Section~\ref{sec:relation} (typed for $T$'s kind, settlement
+  tag ``spend''). Issuer: verify; atomically insert
+  $(\Null, \text{request digest}, \text{response})$, replaying the stored
+  response on exact retry and rejecting conflicting reuse; return
+  $\sigma' \gets \Spre(\mathsf{sk}, \Cred')$. Client: accept the direct
+  token $(\sigma', \kappa', b', \rho')$ iff $P^\ast(\sigma') = \Cred'$.
+  \item $\mathsf{SpendDeferred}$: as $\mathsf{Spend}$ with settlement tag
+  ``deferred-return-spend''; after verification and nullifier insertion
+  the issuer picks $t' \le s$ and returns $(t', \sigma')$ with
+  $\sigma' \gets \Spre(\mathsf{sk}, \Def(\ctx, \Cred', t'))$. Client:
+  accept the deferred-return token $(\sigma', \kappa', b', \rho', t')$ iff
+  $t' \le s$ and $P^\ast(\sigma') = \Def(\ctx, \Cred', t')$.
+  \item $\mathsf{VerifyToken}(\mathsf{pk}, T)$: recompute $T$'s target
+  ($\Cred$ or $\Def$) from its opening and check
+  $P^\ast(\sigma) = \text{target}$.
+\end{itemize}
+\caption{The VOLE-ACT algorithms. Every request and response carries the
+credential-kind and settlement-mode tags; request digests bind the full
+typed request bytes under $\ctx$.}
+\label{fig:algorithms}
+\end{figure}
+
 \subsection{The spend relation}
+\label{sec:relation}
 
 To spend public amount $s$ from a direct token, the client reveals
 $(s, \Null, \Cred')$ and proves knowledge of
@@ -502,7 +606,7 @@ $2^{-\lambda}$. The committed signature nibbles enter as bit wires
 ($4 k_w n = 1296$ bits). The same mechanism folds the 64 quadratic carry
 equations of each balance addition.
 
-\subsection{Balance arithmetic in $\Ftwo$}
+\subsection{Balance arithmetic in \texorpdfstring{$\Ftwo$}{GF(2)}}
 
 Additions are proven bitwise with committed carry vectors:
 $a_i + b_i + c_i = s_i$ linearly (over $\Ftwo$, addition is XOR --- an early
@@ -523,18 +627,30 @@ govern.
 
 \begin{claim}[Fiscal soundness, conditional]
 \label{claim:fiscal}
-In the ideal-XOF model, under Assumption~\ref{ass:omp} and the knowledge
-soundness of the VOLEitH argument for the spend relation, VOLE-ACT
-satisfies Definition~\ref{def:fiscal}, with concrete security bounded by
-the terms below.
+In the ideal-XOF model of Remark~\ref{rem:xof}, under
+Assumption~\ref{ass:omp}, adaptive multi-theorem knowledge soundness
+(extractability) of the VOLEitH argument for \emph{both} the issuance and
+the spend relations, and a linearizable, non-rollback nullifier store,
+VOLE-ACT satisfies Definition~\ref{def:fiscal}.
 \end{claim}
 
 \noindent\emph{Discussion and error terms.}
-Conditionally on extraction, an accepted spend yields a MAYO preimage for a
-well-formed credential digest, correct nullifier derivation, and exact
-balance arithmetic; over-redemption then requires either one more preimage
-than the issuer produced (Assumption~\ref{ass:omp}) or a credential-stream
-collision. The concrete terms are not $2^{-\lambda}$:
+Conditionally on extraction, every accepted operation yields an opening
+and a MAYO preimage for an admissible target, correct nullifier
+derivation, and exact balance arithmetic; over-redemption then requires
+either one more admissible preimage than the issuer produced
+(Assumption~\ref{ass:omp}) or a \emph{target collision}. The collision
+cases are: two credential-stream openings with equal $\Cred$; two
+deferred wrappers with equal $\Def$ output; and a cross-domain collision
+$\Cred = \Def(\cdot)$ --- the domain tags separate the hash inputs, but
+all three remain generic collision events in the same $4m$-bit output
+space and must be counted. Issuance soundness matters because
+Assumption~\ref{ass:omp} feeds the oracle only opening-accompanied
+targets: without it, a malicious issuance request could obtain a preimage
+for an unopened target. The dominant known terms and generic ceilings
+include (this is not yet a complete advantage expression --- proof-attempt
+counts, $Q_H$ factors, vector-commitment and consistency terms, and
+composition loss are unquantified):
 \begin{itemize}
   \item The degree-16 batched QuickSilver check contributes up to
   $17/2^{128} \approx 2^{-123.9}$ per proof attempt, before
@@ -556,21 +672,24 @@ store, whose atomic retry semantics also make honest retransmission safe.
 
 \begin{claim}[Spend anonymity, conditional]
 \label{claim:anon}
-In the ideal-XOF model, assuming the zero knowledge of the salted
-Fiat--Shamir-compiled VOLEitH argument, VOLE-ACT satisfies
+In the ideal-XOF model of Remark~\ref{rem:xof}, assuming the VOLEitH
+argument is adaptive multi-theorem non-interactive zero knowledge for the
+chosen-key relation (i.e., against maliciously formed but canonically
+parsed public keys, in the ROM), VOLE-ACT satisfies
 Definition~\ref{def:anon}; the claim does not depend on any MAYO
 assumption.
 \end{claim}
 
 \noindent\emph{Discussion.}
 A spend reveals $(s, \Null, \Cred', \text{proof})$. The intended argument:
-the argument system is honest-verifier zero knowledge, compiled with a
-$2\lambda$-bit per-proof salt; $\Cred'$ hides its opening under the fresh
-256-bit nonce $\rho'$; and $\Null$ is the unrevealed suffix of an XOF
-stream whose prefix the issuer saw at issuance, pseudorandom given the
-prefix in the ideal-XOF model. None of these steps is currently backed by
-a proof for this exact composition, so the claim is conditional on all
-three. Its MAYO-independence is the design's compartmentalization: a
+the compiled argument is NIZK zero-knowledge in the sense above (the
+$2\lambda$-bit per-proof salt is multi-instance \emph{hardening}, not by
+itself a theorem upgrading honest-verifier ZK to this property); $\Cred'$
+hides its opening under the fresh 256-bit nonce $\rho'$; and $\Null$ is
+the unrevealed suffix of an XOF stream whose prefix the issuer saw at
+issuance, pseudorandom given the prefix in the ideal-XOF model. None of
+these steps is currently backed by a proof for this exact composition, so
+the claim is conditional on all three. Its MAYO-independence is the design's compartmentalization: a
 trapdoor recovery or forgery does not help the distinguisher in
 Definition~\ref{def:anon}. Outside the game, deployments leak metadata the
 definition deliberately excludes: spend amounts are public; direct-input
@@ -601,8 +720,10 @@ spend). Figures are single-operation latencies on an idle machine. The
 compact profile's proving penalty over low-latency is $\approx$6--7\%
 while its proofs are $3.8\times$ smaller. Implementation techniques,
 optimization methodology, and full per-profile measurements are documented
-in the repository (\texttt{docs/IMPLEMENTATION.md},
-\texttt{docs/BENCHMARKS.md}).
+in the repository,
+\url{https://github.com/SamuelSchlesinger/vole-act}
+(\texttt{docs/IMPLEMENTATION.md}, \texttt{docs/BENCHMARKS.md}; the
+measurements in this paper correspond to commit \texttt{65248c8}).
 
 \begin{table}[h]
 \centering
@@ -691,12 +812,13 @@ VOLE-in-the-Head}.
 CRYPTO 2023.
 
 \bibitem{FAEST}
-C.~Baum, L.~Braun, C.~Delpech de Saint Guilhem, M.~Kloo{\ss}, C.~Majenz,
-S.~Mukherjee, E.~Orsini, S.~Ramacher, C.~Rechberger, L.~Roy, P.~Scholl.
+C.~Baum, W.~Beullens, L.~Braun, C.~Delpech de Saint Guilhem, M.~Kloo{\ss},
+C.~Majenz, S.~Mukherjee, E.~Orsini, S.~Ramacher, C.~Rechberger, L.~Roy,
+P.~Scholl.
 \emph{FAEST: Algorithm Specification, Version 2.0 (Round-2 document)}.
 NIST PQC Additional Digital Signatures. This work follows the Round-2
 (v2.0) design; FAEST advanced to Round 3 in May 2026.
-\url{https://faest.info}. % verify the versioned author list against the v2.0 PDF
+\url{https://faest.info}.
 
 \bibitem{OneTree}
 C.~Baum, W.~Beullens, S.~Mukherjee, E.~Orsini, S.~Ramacher, C.~Rechberger,
