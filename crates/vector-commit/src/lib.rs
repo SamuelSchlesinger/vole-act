@@ -19,9 +19,13 @@
 
 use sha3::Shake256;
 use sha3::digest::{ExtendableOutput, Update, XofReader};
+use zeroize::Zeroize;
 
 /// Length in bytes of a tree seed (λ = 128).
 pub const SEED_LEN: usize = 16;
+/// Length in bytes of the salt bound into every PRG/hash call (2λ = 256
+/// bits, matching FAEST's salt width for multi-instance hardening).
+pub const SALT_LEN: usize = 32;
 /// Length in bytes of a leaf/root commitment hash (2λ = 256 bits).
 pub const COM_LEN: usize = 32;
 
@@ -38,6 +42,9 @@ mod tags {
 
 /// A seed: the value committed at each leaf.
 pub type Seed = [u8; SEED_LEN];
+
+/// A salt domain-separating all PRG/hash calls of one tree.
+pub type Salt = [u8; SALT_LEN];
 
 /// Errors returned by [`AllButOneVc::verify`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,7 +94,7 @@ pub struct AllButOneVc {
 }
 
 /// Length-doubling PRG: expand a node seed into its two children.
-fn expand_node(salt: &[u8; SEED_LEN], level: u32, index: u64, seed: &Seed) -> (Seed, Seed) {
+fn expand_node(salt: &Salt, level: u32, index: u64, seed: &Seed) -> (Seed, Seed) {
     let mut h = Shake256::default();
     h.update(tags::EXPAND);
     h.update(salt);
@@ -104,7 +111,7 @@ fn expand_node(salt: &[u8; SEED_LEN], level: u32, index: u64, seed: &Seed) -> (S
 }
 
 /// Commitment hash for a single leaf seed.
-fn leaf_com(salt: &[u8; SEED_LEN], index: u64, seed: &Seed) -> [u8; COM_LEN] {
+fn leaf_com(salt: &Salt, index: u64, seed: &Seed) -> [u8; COM_LEN] {
     let mut h = Shake256::default();
     h.update(tags::LEAF_COM);
     h.update(salt);
@@ -116,7 +123,7 @@ fn leaf_com(salt: &[u8; SEED_LEN], index: u64, seed: &Seed) -> [u8; COM_LEN] {
 }
 
 /// The root commitment hash over all leaf commitments.
-fn root_hash(salt: &[u8; SEED_LEN], depth: u32, coms: &[[u8; COM_LEN]]) -> [u8; COM_LEN] {
+fn root_hash(salt: &Salt, depth: u32, coms: &[[u8; COM_LEN]]) -> [u8; COM_LEN] {
     let mut h = Shake256::default();
     h.update(tags::ROOT);
     h.update(salt);
@@ -129,14 +136,30 @@ fn root_hash(salt: &[u8; SEED_LEN], depth: u32, coms: &[[u8; COM_LEN]]) -> [u8; 
     out
 }
 
+impl Drop for AllButOneVc {
+    fn drop(&mut self) {
+        // Every node seed — including the hidden leaf whose secrecy is what
+        // makes past proofs zero-knowledge — is wiped when the prover state
+        // is dropped. Leaf commitments are recomputable from opened seeds,
+        // but wiping them too costs nothing.
+        self.levels.zeroize();
+        self.leaf_coms.zeroize();
+    }
+}
+
+impl zeroize::ZeroizeOnDrop for AllButOneVc {}
+
 impl AllButOneVc {
     /// Expand `root_seed` into a full depth-`depth` GGM tree and commit.
     ///
-    /// `salt` must be fresh per proof (derived from the transcript); it
+    /// `salt` must be unique per *tree*, not merely per proof: two trees
+    /// committed under one salt share PRG inputs at equal `(level, index)`
+    /// positions. Callers batching τ trees (as `voleith` does) must derive an
+    /// independent salt per tree from the transcript; the salt
     /// domain-separates all PRG/hash calls against multi-instance attacks.
     pub fn commit(
         root_seed: Seed,
-        salt: [u8; SEED_LEN],
+        salt: Salt,
         depth: u32,
     ) -> Result<(Self, VcCommitment), VcError> {
         if depth == 0 || depth > MAX_DEPTH {
@@ -206,7 +229,7 @@ impl AllButOneVc {
     /// hidden position `hide` and `Some(seed)` everywhere else.
     pub fn verify(
         com: &VcCommitment,
-        salt: [u8; SEED_LEN],
+        salt: Salt,
         depth: u32,
         hide: usize,
         opening: &VcOpening,
@@ -266,16 +289,20 @@ mod tests {
         core::array::from_fn(|i| tag.wrapping_add(i as u8))
     }
 
+    fn test_salt(tag: u8) -> Salt {
+        core::array::from_fn(|i| tag.wrapping_add(i as u8))
+    }
+
     #[test]
     fn roundtrip_all_depths_and_positions() {
         for depth in 1..=6u32 {
-            let (vc, com) = AllButOneVc::commit(test_seed(1), test_seed(2), depth).unwrap();
+            let (vc, com) = AllButOneVc::commit(test_seed(1), test_salt(2), depth).unwrap();
             let n = vc.num_leaves();
             assert_eq!(n, 1 << depth);
             for hide in 0..n {
                 let opening = vc.open_all_but_one(hide).unwrap();
                 let leaves =
-                    AllButOneVc::verify(&com, test_seed(2), depth, hide, &opening).unwrap();
+                    AllButOneVc::verify(&com, test_salt(2), depth, hide, &opening).unwrap();
                 assert_eq!(leaves.len(), n);
                 for (i, leaf) in leaves.iter().enumerate() {
                     if i == hide {
@@ -290,12 +317,12 @@ mod tests {
 
     #[test]
     fn deterministic_commitment() {
-        let (_, com1) = AllButOneVc::commit(test_seed(7), test_seed(9), 5).unwrap();
-        let (_, com2) = AllButOneVc::commit(test_seed(7), test_seed(9), 5).unwrap();
+        let (_, com1) = AllButOneVc::commit(test_seed(7), test_salt(9), 5).unwrap();
+        let (_, com2) = AllButOneVc::commit(test_seed(7), test_salt(9), 5).unwrap();
         assert_eq!(com1, com2);
         // Different salt or seed changes the commitment.
-        let (_, com3) = AllButOneVc::commit(test_seed(7), test_seed(10), 5).unwrap();
-        let (_, com4) = AllButOneVc::commit(test_seed(8), test_seed(9), 5).unwrap();
+        let (_, com3) = AllButOneVc::commit(test_seed(7), test_salt(10), 5).unwrap();
+        let (_, com4) = AllButOneVc::commit(test_seed(8), test_salt(9), 5).unwrap();
         assert_ne!(com1, com3);
         assert_ne!(com1, com4);
     }
@@ -303,7 +330,7 @@ mod tests {
     #[test]
     fn tampered_openings_are_rejected() {
         let depth = 5u32;
-        let salt = test_seed(3);
+        let salt = test_salt(3);
         let (vc, com) = AllButOneVc::commit(test_seed(1), salt, depth).unwrap();
         let hide = 13;
         let opening = vc.open_all_but_one(hide).unwrap();
@@ -338,7 +365,7 @@ mod tests {
 
         // Wrong salt.
         assert_eq!(
-            AllButOneVc::verify(&com, test_seed(4), depth, hide, &opening),
+            AllButOneVc::verify(&com, test_salt(4), depth, hide, &opening),
             Err(VcError::InvalidOpening)
         );
 
@@ -353,11 +380,11 @@ mod tests {
 
     #[test]
     fn parameter_validation() {
-        assert!(AllButOneVc::commit(test_seed(0), test_seed(0), 0).is_err());
-        assert!(AllButOneVc::commit(test_seed(0), test_seed(0), MAX_DEPTH + 1).is_err());
-        let (vc, com) = AllButOneVc::commit(test_seed(0), test_seed(0), 3).unwrap();
+        assert!(AllButOneVc::commit(test_seed(0), test_salt(0), 0).is_err());
+        assert!(AllButOneVc::commit(test_seed(0), test_salt(0), MAX_DEPTH + 1).is_err());
+        let (vc, com) = AllButOneVc::commit(test_seed(0), test_salt(0), 3).unwrap();
         assert!(vc.open_all_but_one(8).is_err());
         let opening = vc.open_all_but_one(0).unwrap();
-        assert!(AllButOneVc::verify(&com, test_seed(0), 3, 8, &opening).is_err());
+        assert!(AllButOneVc::verify(&com, test_salt(0), 3, 8, &opening).is_err());
     }
 }

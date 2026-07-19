@@ -97,6 +97,20 @@ mod tests {
         assert_ne!(b.pow(5), GF2p128::ONE);
     }
 
+    /// Pins the exact canonical β. All four conjugate roots β, β², β⁴, β⁸ of
+    /// `x⁴ + x + 1` satisfy every *property* test in this module; only this
+    /// known-answer constant distinguishes them. If a refactor of
+    /// [`compute_beta`] changes this value, every serialized proof becomes
+    /// incompatible across versions — that is a protocol break, not a
+    /// harmless cleanup.
+    #[test]
+    fn beta_known_answer() {
+        assert_eq!(
+            embed_gf16(GF16::new(0b0010)).to_u128(),
+            0x8b49_8493_3933_4e30_987a_355c_bf0c_842b,
+        );
+    }
+
     #[test]
     fn embedding_is_deterministic_and_injective() {
         let images: Vec<GF2p128> = (0..16).map(|i| embed_gf16(GF16::new(i))).collect();

@@ -39,11 +39,13 @@ use crate::vole::{Params, ProverVole, reconstruct_keys, split_delta};
 use binary_fields::{BinaryField, GF2p128};
 use rand_core::CryptoRngCore;
 use sha3::digest::XofReader;
-use vector_commit::{MAX_DEPTH, Seed, VcCommitment, VcOpening};
+use vector_commit::{MAX_DEPTH, SALT_LEN, Seed, VcCommitment, VcOpening};
+use zeroize::{Zeroize, Zeroizing};
 
 const PROTOCOL_LABEL: &[u8] = b"VOLE-ACT/voleith/v1";
 const MAX_DEGREE: usize = 16;
-const PROOF_WIRE_MAGIC: &[u8; 5] = b"VITH\x01";
+const PROOF_WIRE_MAGIC: &[u8; 4] = b"VITH";
+const PROOF_WIRE_VERSION: u8 = 1;
 
 /// Maximum canonical proof encoding accepted by [`Proof::from_bytes`].
 ///
@@ -55,11 +57,14 @@ pub const MAX_PROOF_WIRE_BYTES: usize = 16 * 1024 * 1024;
 /// Failure to decode a canonical VOLE-in-the-head proof.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProofDecodeError {
-    /// The input is truncated, has a wrong type/version tag, contains a
+    /// The input is truncated, has a wrong type tag, contains a
     /// non-canonical bit vector, has impossible lengths, or has trailing data.
     InvalidEncoding,
     /// The encoded proof exceeds [`MAX_PROOF_WIRE_BYTES`].
     TooLarge,
+    /// The artifact is a VOLE-in-the-head proof, but from a format version
+    /// this library does not implement.
+    UnsupportedVersion,
 }
 
 impl core::fmt::Display for ProofDecodeError {
@@ -67,6 +72,7 @@ impl core::fmt::Display for ProofDecodeError {
         match self {
             Self::InvalidEncoding => write!(f, "invalid canonical proof encoding"),
             Self::TooLarge => write!(f, "proof encoding exceeds the configured limit"),
+            Self::UnsupportedVersion => write!(f, "unsupported proof format version"),
         }
     }
 }
@@ -76,8 +82,9 @@ impl std::error::Error for ProofDecodeError {}
 /// A non-interactive VOLE-in-the-head proof.
 #[derive(Clone, Debug)]
 pub struct Proof {
-    /// Per-proof salt for all PRG/hash domain separation.
-    pub salt: [u8; 16],
+    /// Per-proof salt for all PRG/hash domain separation (2λ bits, as in
+    /// FAEST, so multi-instance seed-guessing attacks get no batching help).
+    pub salt: [u8; SALT_LEN],
     /// Per-tree vector commitments.
     pub coms: Vec<VcCommitment>,
     /// u-corrections `c⁽ʲ⁾` for trees `2..τ`.
@@ -103,7 +110,8 @@ impl Proof {
     /// but not container length prefixes a particular wire codec may add.
     #[must_use]
     pub fn payload_len(&self) -> usize {
-        16 + self.coms.len() * 32
+        SALT_LEN
+            + self.coms.len() * 32
             + self
                 .corrections
                 .iter()
@@ -129,6 +137,7 @@ impl Proof {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.payload_len() + 128);
         out.extend_from_slice(PROOF_WIRE_MAGIC);
+        out.push(PROOF_WIRE_VERSION);
         out.extend_from_slice(&self.salt);
 
         put_len(&mut out, self.coms.len());
@@ -171,6 +180,9 @@ impl Proof {
         }
         let mut decoder = ProofDecoder::new(bytes);
         decoder.expect(PROOF_WIRE_MAGIC)?;
+        if decoder.array::<1>()?[0] != PROOF_WIRE_VERSION {
+            return Err(ProofDecodeError::UnsupportedVersion);
+        }
         let salt = decoder.array()?;
 
         let com_count = decoder.count(32, 128)?;
@@ -333,7 +345,7 @@ fn absorb_prologue(
     params: &Params,
     num_witness_bits: usize,
     max_degree: usize,
-    salt: &[u8; 16],
+    salt: &[u8; SALT_LEN],
     coms: &[VcCommitment],
     corrections: &[BitVec],
     d: &BitVec,
@@ -558,15 +570,18 @@ pub(crate) fn prove_impl<C: Circuit>(
     }
     let l_hat = l + max_degree * lambda;
 
-    // Commit the VOLE correlations.
-    let mut salt = [0u8; 16];
+    // Commit the VOLE correlations. The root seeds are wiped as soon as the
+    // trees are expanded, on the error path too; the tree state and the
+    // VOLE secrets wipe themselves on drop.
+    let mut salt = [0u8; SALT_LEN];
     rng.fill_bytes(&mut salt);
     let mut roots: Vec<Seed> = vec![[0u8; 16]; params.tau];
     for r in roots.iter_mut() {
         rng.fill_bytes(r);
     }
-    let vole = ProverVole::commit(&roots, &salt, l_hat, params)
-        .map_err(|_| VoleithError::InvalidParameters)?;
+    let vole_result = ProverVole::commit(&roots, &salt, l_hat, params);
+    roots.zeroize();
+    let mut vole = vole_result.map_err(|_| VoleithError::InvalidParameters)?;
 
     // Run the circuit: collects d corrections and constraint coefficients.
     let mut backend = ProverBackend::new(witness, &vole.u, &vole.tags);
@@ -610,15 +625,22 @@ pub(crate) fn prove_impl<C: Circuit>(
 
     // QuickSilver batch. Quadratic systems draw their fold coefficients
     // from the same challenge stream, in emission order, before their χ.
+    // The mask VOLEs and the raw per-constraint coefficients are secrets
+    // (only their χ-weighted sums are published); wipe both.
     let mut chi = tr.challenge_xof(b"chi");
-    let masks = qs_mask_groups(l, lambda, max_degree - 1, Some(&vole.u), &vole.tags);
+    let mut masks = qs_mask_groups(l, lambda, max_degree - 1, Some(&vole.u), &vole.tags);
     let mut qs_coefficients = vec![GF2p128::ZERO; max_degree];
-    for (index, (mask_value, mask_tag)) in masks.into_iter().enumerate() {
-        qs_coefficients[index] += mask_tag;
-        qs_coefficients[index + 1] += mask_value;
+    for (index, (mask_value, mask_tag)) in masks.iter().enumerate() {
+        qs_coefficients[index] += *mask_tag;
+        qs_coefficients[index + 1] += *mask_value;
     }
+    for (mask_value, mask_tag) in masks.iter_mut() {
+        mask_value.zeroize();
+        mask_tag.zeroize();
+    }
+    drop(masks);
     for constraint in &backend.constraints {
-        let coefficients = match constraint {
+        let coefficients = Zeroizing::new(match constraint {
             ProverConstraint::Simple(a0, a1) => vec![*a0, *a1, GF2p128::ZERO],
             ProverConstraint::System(sys) => {
                 let phis: Vec<GF2p128> = (0..sys.num_equations())
@@ -631,7 +653,7 @@ pub(crate) fn prove_impl<C: Circuit>(
                 vec![a0, a1, error]
             }
             ProverConstraint::Polynomial(coefficients) => coefficients.clone(),
-        };
+        });
         let x = next_elem(&mut chi);
         // The leading coefficient is the asserted circuit value. The prover
         // claims it is zero by omitting it; the verifier's evaluation retains
@@ -656,10 +678,12 @@ pub(crate) fn prove_impl<C: Circuit>(
         .open(&chunks)
         .map_err(|_| VoleithError::InvalidParameters)?;
 
+    // `vole` wipes `u` and the tags when it drops below; the published
+    // commitments and corrections move into the proof first.
     Ok(Proof {
         salt,
-        coms: vole.coms,
-        corrections: vole.corrections,
+        coms: core::mem::take(&mut vole.coms),
+        corrections: core::mem::take(&mut vole.corrections),
         d,
         u_tilde,
         v_tilde,

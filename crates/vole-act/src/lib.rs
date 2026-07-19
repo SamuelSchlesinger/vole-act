@@ -70,8 +70,9 @@ mod wire;
 pub use protocol::{
     CredentialKind, DeferredReturn, DeferredReturnSpendRequest, DeferredReturnSpendResponse,
     DeferredReturnToken, Direct, DirectToken, Error, IssueRequest, IssueResponse, Issuer,
-    MemoryNullifierStore, NullifierStore, PendingDeferredReturnSpend, PendingIssue, PendingSpend,
-    PerformanceProfile, PreparedDeferredReturnSpend, PreparedSpend, PublicKey, RetryRecord,
-    RetryResponse, SpendRequest, SpendResponse, Token,
+    MAX_APPLICATION_CONTEXT_BYTES, MemoryNullifierStore, NullifierStore,
+    PendingDeferredReturnSpend, PendingIssue, PendingSpend, PerformanceProfile,
+    PreparedDeferredReturnSpend, PreparedSpend, PublicKey, RetryRecord, RetryResponse,
+    SpendRequest, SpendResponse, Token,
 };
 pub use wire::{MAX_WIRE_BYTES, WireError};

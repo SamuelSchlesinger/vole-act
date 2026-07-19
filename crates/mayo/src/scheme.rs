@@ -5,7 +5,7 @@ use crate::params::MayoParams;
 use binary_fields::{BinaryField, GF16};
 use core::marker::PhantomData;
 use rand_core::CryptoRngCore;
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 /// Errors from the MAYO algorithms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,14 +118,16 @@ impl<'a> NibbleReader<'a> {
 
     fn matrix(&mut self, rows: usize, cols: usize, upper: bool) -> Result<Mat, MayoError> {
         let len = rows.checked_mul(cols).ok_or(MayoError::InvalidEncoding)?;
-        let mut data = vec![GF16::ZERO; len];
+        // Wrap the staging buffer so partially decoded (possibly secret-key)
+        // nibbles are wiped even when a later `nibble()` call fails.
+        let mut data = Zeroizing::new(vec![GF16::ZERO; len]);
         for row in 0..rows {
             let start = if upper { row } else { 0 };
             for column in start..cols {
                 data[row * cols + column] = self.nibble()?;
             }
         }
-        Mat::from_data(rows, cols, data).ok_or(MayoError::InvalidEncoding)
+        Mat::from_data(rows, cols, data.to_vec()).ok_or(MayoError::InvalidEncoding)
     }
 
     fn finish(self) -> Result<(), MayoError> {
@@ -511,12 +513,13 @@ pub fn spre<P: MayoParams>(
             .collect();
         let mut r: Vec<GF16> = (0..k * o).map(|_| GF16::random(rng)).collect();
 
-        // M_i ∈ F^{m×o} with M_i[a,:] = v_iᵀ L_a.
+        // M_i ∈ F^{m×o} with M_i[a,:] = v_iᵀ L_a. The row temporaries are
+        // vinegar-dependent secrets and must not linger in freed heap memory.
         let mut m_mats: Vec<Mat> = (0..k)
             .map(|i| {
                 let mut mi = Mat::zero(m, o);
                 for a in 0..m {
-                    let row = sk.l[a].vec_mul(&vinegar[i]);
+                    let row = Zeroizing::new(sk.l[a].vec_mul(&vinegar[i]));
                     for c in 0..o {
                         mi[(a, c)] = row[c];
                     }
@@ -541,8 +544,9 @@ pub fn spre<P: MayoParams>(
         let mut ell = 0;
         for i in 0..k {
             for j in (i..k).rev() {
-                // Vinegar-only contribution, moved to the RHS.
-                let mut u = vec![GF16::ZERO; m];
+                // Vinegar-only contribution, moved to the RHS. Both the raw
+                // and shifted vinegar quadratic values are secrets.
+                let mut u = Zeroizing::new(vec![GF16::ZERO; m]);
                 for (a, u_a) in u.iter_mut().enumerate() {
                     *u_a = if i == j {
                         dot(&vinegar[i], &w[a][i])
@@ -550,7 +554,7 @@ pub fn spre<P: MayoParams>(
                         dot(&vinegar[i], &w[a][j]) + dot(&vinegar[j], &w[a][i])
                     };
                 }
-                let shifted = mul_z_pow::<P>(&u, ell);
+                let shifted = Zeroizing::new(mul_z_pow::<P>(&u, ell));
                 for (y_b, u_b) in y.iter_mut().zip(shifted.iter()) {
                     *y_b += *u_b;
                 }
@@ -574,11 +578,13 @@ pub fn spre<P: MayoParams>(
             continue;
         };
 
-        // Assemble s: s_i = (v_i + O·x_i) ‖ x_i.
+        // Assemble s: s_i = (v_i + O·x_i) ‖ x_i. `O·x_i` must be wiped:
+        // the oil block x_i is public in the emitted preimage, so a freed
+        // heap copy of `O·x_i` would yield linear equations on `O` itself.
         let mut s = vec![GF16::ZERO; P::KN];
         for i in 0..k {
             let x_i = &x[i * o..(i + 1) * o];
-            let ox = sk.o.mul_vec(x_i);
+            let ox = Zeroizing::new(sk.o.mul_vec(x_i));
             for (idx, val) in vinegar[i]
                 .iter()
                 .zip(ox.iter())
@@ -609,8 +615,9 @@ fn add_shifted_block<P: MayoParams>(a: &mut Mat, m_mat: &Mat, col: usize, ell: u
     let m = P::M;
     let o = P::O;
     for c in 0..o {
-        let column: Vec<GF16> = (0..m).map(|r| m_mat[(r, c)]).collect();
-        let shifted = mul_z_pow::<P>(&column, ell);
+        // Columns of the secret system matrix; wipe both staging buffers.
+        let column = Zeroizing::new((0..m).map(|r| m_mat[(r, c)]).collect::<Vec<GF16>>());
+        let shifted = Zeroizing::new(mul_z_pow::<P>(&column, ell));
         for (r, val) in shifted.iter().enumerate() {
             a[(r, col + c)] += *val;
         }

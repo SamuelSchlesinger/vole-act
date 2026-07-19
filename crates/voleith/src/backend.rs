@@ -16,6 +16,7 @@
 
 use crate::VoleithError;
 use binary_fields::{BinaryField, GF2p128, GF16, embed_gf16};
+use zeroize::Zeroize;
 
 /// Build the 16-entry lookup table `nib ↦ φ·embed(nib)` for one fold
 /// coefficient, so that folding a GF(16)-coefficient equation system costs
@@ -128,6 +129,19 @@ pub enum ProverConstraint {
     Polynomial(Vec<GF2p128>),
 }
 
+impl Zeroize for ProverConstraint {
+    fn zeroize(&mut self) {
+        match self {
+            ProverConstraint::Simple(a0, a1) => {
+                a0.zeroize();
+                a1.zeroize();
+            }
+            ProverConstraint::System(system) => system.zeroize(),
+            ProverConstraint::Polynomial(coefficients) => coefficients.zeroize(),
+        }
+    }
+}
+
 /// Prover-side polynomial expression, coefficients in low-to-high order.
 #[derive(Clone, Debug)]
 pub struct ProverExpr {
@@ -140,6 +154,22 @@ pub struct ProverQuadSystem {
     terms: Vec<(GF2p128, GF2p128, GF2p128, GF2p128, Vec<GF16>)>,
     /// Per equation: `(value, tag)` of the linear wire.
     linear: Vec<(GF2p128, GF2p128)>,
+}
+
+impl Zeroize for ProverQuadSystem {
+    fn zeroize(&mut self) {
+        for (value_a, tag_a, value_b, tag_b, coeffs) in self.terms.iter_mut() {
+            value_a.zeroize();
+            tag_a.zeroize();
+            value_b.zeroize();
+            tag_b.zeroize();
+            coeffs.zeroize();
+        }
+        for (value, tag) in self.linear.iter_mut() {
+            value.zeroize();
+            tag.zeroize();
+        }
+    }
 }
 
 impl ProverQuadSystem {
@@ -188,6 +218,15 @@ pub struct ProverBackend<'a> {
     /// Whether every *simple* constraint holds for the provided witness
     /// (quadratic systems are checked at fold time).
     pub satisfied: bool,
+}
+
+impl Drop for ProverBackend<'_> {
+    fn drop(&mut self) {
+        // Recorded constraints hold raw witness values and VOLE tags (the
+        // published QuickSilver coefficients are the χ-masked combinations,
+        // not these). Wipe them on every exit path from the prover.
+        self.constraints.zeroize();
+    }
 }
 
 impl<'a> ProverBackend<'a> {

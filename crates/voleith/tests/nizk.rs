@@ -307,11 +307,11 @@ fn proof_wire_codec_is_canonical_and_fail_closed() {
     trailing.push(0);
     assert!(voleith::Proof::from_bytes(&trailing).is_err());
 
-    // The first correction's logical bit length begins after magic, salt,
-    // commitments, and the correction count. Give it an impossible u64
-    // length; the decoder must reject before allocating.
+    // The first correction's logical bit length begins after magic, version,
+    // the 32-byte salt, commitments, and the correction count. Give it an
+    // impossible u64 length; the decoder must reject before allocating.
     let mut huge = encoded;
-    let first_correction_len = 5 + 16 + 4 + PARAMS_128.tau * 32 + 4;
+    let first_correction_len = 5 + 32 + 4 + PARAMS_128.tau * 32 + 4;
     huge[first_correction_len..first_correction_len + 8].copy_from_slice(&u64::MAX.to_le_bytes());
     assert!(voleith::Proof::from_bytes(&huge).is_err());
 }

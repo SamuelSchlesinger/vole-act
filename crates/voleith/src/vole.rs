@@ -20,7 +20,8 @@ use crate::bits::BitVec;
 use binary_fields::{BinaryField, GF2p128};
 use sha3::Shake256;
 use sha3::digest::{ExtendableOutput, Update, XofReader};
-use vector_commit::{AllButOneVc, Seed, VcCommitment, VcError, VcOpening};
+use vector_commit::{AllButOneVc, SALT_LEN, Salt, Seed, VcCommitment, VcError, VcOpening};
+use zeroize::{Zeroize, Zeroizing};
 
 /// VOLE-in-the-head parameters. `λ = tau · k` must equal 128.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,18 +75,18 @@ impl Params {
 }
 
 /// Derive the salt for tree `j`'s internal vector-commitment hashing.
-fn tree_salt(salt: &[u8; 16], j: usize) -> [u8; 16] {
+fn tree_salt(salt: &[u8; SALT_LEN], j: usize) -> Salt {
     let mut h = Shake256::default();
     h.update(b"VOLE-ACT/voleith/v1/tree-salt");
     h.update(salt);
     h.update(&(j as u64).to_le_bytes());
-    let mut out = [0u8; 16];
+    let mut out = [0u8; SALT_LEN];
     h.finalize_xof().read(&mut out);
     out
 }
 
 /// Expand leaf `i` of tree `j` into its ℓ̂-bit VOLE contribution.
-fn expand_leaf(salt: &[u8; 16], j: usize, i: usize, seed: &Seed, l_hat: usize) -> BitVec {
+fn expand_leaf(salt: &[u8; SALT_LEN], j: usize, i: usize, seed: &Seed, l_hat: usize) -> BitVec {
     let mut h = Shake256::default();
     h.update(b"VOLE-ACT/voleith/v1/leaf-expand");
     h.update(salt);
@@ -116,6 +117,10 @@ fn assemble(planes: &[Vec<BitVec>], params: &Params, l_hat: usize) -> Vec<GF2p12
 
 /// Prover-side VOLE state: the committed random vector `u`, per-coordinate
 /// tags `V`, tree commitments, and public corrections.
+///
+/// `u` and the tags are wiped on drop (the trees wipe their own seeds), so
+/// early-error paths in the prover do not leave VOLE secrets in freed heap
+/// memory. The commitments and corrections are published and are not wiped.
 pub struct ProverVole {
     /// The shared committed random bit vector (`u = u⁽¹⁾`), length ℓ̂.
     pub u: BitVec,
@@ -128,11 +133,20 @@ pub struct ProverVole {
     trees: Vec<AllButOneVc>,
 }
 
+impl Drop for ProverVole {
+    fn drop(&mut self) {
+        self.u.zeroize();
+        self.tags.zeroize();
+    }
+}
+
+impl zeroize::ZeroizeOnDrop for ProverVole {}
+
 impl ProverVole {
     /// Commit to ℓ̂ VOLE correlations across τ trees.
     pub fn commit(
         root_seeds: &[Seed],
-        salt: &[u8; 16],
+        salt: &[u8; SALT_LEN],
         l_hat: usize,
         params: &Params,
     ) -> Result<Self, VcError> {
@@ -150,7 +164,7 @@ impl ProverVole {
             let mut u_j = BitVec::zero(l_hat);
             let mut planes_j = vec![BitVec::zero(l_hat); params.k];
             for (i, leaf) in vc.leaves().iter().enumerate() {
-                let r_i = expand_leaf(salt, j, i, leaf, l_hat);
+                let r_i = Zeroizing::new(expand_leaf(salt, j, i, leaf, l_hat));
                 u_j.xor_assign(&r_i);
                 for (b, plane) in planes_j.iter_mut().enumerate() {
                     if (i >> b) & 1 == 1 {
@@ -174,6 +188,10 @@ impl ProverVole {
             })
             .collect();
         let tags = assemble(&planes, params, l_hat);
+        // The per-tree vectors and tag planes are as secret as the VOLE
+        // itself; wipe them now that `u`/`corrections`/`tags` are assembled.
+        us.zeroize();
+        planes.zeroize();
 
         Ok(ProverVole {
             u,
@@ -201,7 +219,7 @@ impl ProverVole {
 /// (u-stage: after corrections, before witness adjustments) from the tree
 /// openings and challenge indices.
 pub fn reconstruct_keys(
-    salt: &[u8; 16],
+    salt: &[u8; SALT_LEN],
     l_hat: usize,
     params: &Params,
     coms: &[VcCommitment],
@@ -295,7 +313,7 @@ mod tests {
     fn vole_correlation_invariant() {
         let params = PARAMS_128;
         let l_hat = 300;
-        let salt = [7u8; 16];
+        let salt = [7u8; 32];
         let roots: Vec<Seed> = (0..params.tau)
             .map(|j| core::array::from_fn(|i| (j * 31 + i) as u8))
             .collect();
@@ -331,7 +349,7 @@ mod tests {
     fn tampered_correction_changes_keys() {
         let params = PARAMS_128;
         let l_hat = 64;
-        let salt = [1u8; 16];
+        let salt = [1u8; 32];
         let roots: Vec<Seed> = (0..params.tau)
             .map(|j| core::array::from_fn(|i| (j * 17 + i * 3) as u8))
             .collect();
@@ -370,7 +388,7 @@ mod tests {
         let invalid = Params { tau: 1, k: 128 };
         assert_eq!(invalid.leaves(), 0);
         assert_eq!(
-            ProverVole::commit(&[[0u8; 16]], &[0u8; 16], 8, &invalid).err(),
+            ProverVole::commit(&[[0u8; 16]], &[0u8; 32], 8, &invalid).err(),
             Some(VcError::InvalidParameters)
         );
         let (_, chunks) = split_delta(&[0u8; 16], &invalid);

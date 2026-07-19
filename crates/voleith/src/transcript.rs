@@ -48,8 +48,21 @@ impl Transcript {
     }
 
     /// Derive `out.len()` challenge bytes and ratchet the state.
+    ///
+    /// The output length is bound into the hash input, so a 16-byte
+    /// challenge is not a prefix of a 32-byte challenge under the same
+    /// state and label (and neither collides with [`Self::challenge_xof`],
+    /// which uses a different domain tag).
     pub fn challenge_bytes(&mut self, label: &'static [u8], out: &mut [u8]) {
-        shake(&[b"VOLE-ACT/fs/v1/challenge", &self.state, label], out);
+        shake(
+            &[
+                b"VOLE-ACT/fs/v1/challenge-bytes",
+                &self.state,
+                &(out.len() as u64).to_le_bytes(),
+                label,
+            ],
+            out,
+        );
         self.ratchet(label);
     }
 

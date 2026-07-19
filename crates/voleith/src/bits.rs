@@ -1,6 +1,7 @@
 //! A minimal bit-vector utility used for VOLE coordinate vectors.
 
 use sha3::digest::XofReader;
+use zeroize::Zeroize;
 
 /// A fixed-length bit vector, stored little-endian within bytes
 /// (bit `t` is `bytes[t/8] >> (t%8) & 1`). Trailing bits of the final byte
@@ -66,15 +67,27 @@ impl BitVec {
     }
 
     /// Read bit `t`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `t >= self.len()`, in release builds too: a silent
+    /// out-of-range read would return a padding bit and break the canonical
+    /// encoding invariant the transcript depends on.
     #[must_use]
     pub fn get(&self, t: usize) -> bool {
-        debug_assert!(t < self.len);
+        assert!(t < self.len);
         (self.bytes[t / 8] >> (t % 8)) & 1 == 1
     }
 
     /// Set bit `t`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `t >= self.len()`, in release builds too: a silent
+    /// out-of-range write could set a padding bit, producing a non-canonical
+    /// `as_bytes()` that diverges from what a decoder would accept.
     pub fn set(&mut self, t: usize, v: bool) {
-        debug_assert!(t < self.len);
+        assert!(t < self.len);
         let mask = 1u8 << (t % 8);
         if v {
             self.bytes[t / 8] |= mask;
@@ -84,8 +97,13 @@ impl BitVec {
     }
 
     /// XOR another equal-length bit vector into this one.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the lengths differ, in release builds too: silently
+    /// truncating to the shorter vector would corrupt VOLE coordinates.
     pub fn xor_assign(&mut self, other: &BitVec) {
-        debug_assert_eq!(self.len, other.len);
+        assert_eq!(self.len, other.len);
         for (a, b) in self.bytes.iter_mut().zip(other.bytes.iter()) {
             *a ^= b;
         }
@@ -95,6 +113,12 @@ impl BitVec {
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
+    }
+}
+
+impl Zeroize for BitVec {
+    fn zeroize(&mut self) {
+        self.bytes.zeroize();
     }
 }
 

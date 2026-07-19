@@ -6,7 +6,8 @@
 
 use binary_fields::GF16;
 
-pub(crate) const MAGIC: &[u8; 5] = b"VACT\x01";
+pub(crate) const MAGIC: &[u8; 4] = b"VACT";
+pub(crate) const WIRE_VERSION: u8 = 1;
 
 /// Largest individual VOLE-ACT artifact accepted by a canonical decoder.
 pub const MAX_WIRE_BYTES: usize = 32 * 1024 * 1024;
@@ -26,6 +27,9 @@ pub enum WireError {
     TooLarge,
     /// A decoded local token failed cryptographic authentication.
     InvalidCredential,
+    /// The artifact is a VOLE-ACT encoding, but from a wire-format version
+    /// this library does not implement.
+    UnsupportedVersion,
 }
 
 impl core::fmt::Display for WireError {
@@ -36,6 +40,7 @@ impl core::fmt::Display for WireError {
             Self::WrongParameterSet => write!(f, "wrong MAYO parameter set"),
             Self::TooLarge => write!(f, "VOLE-ACT artifact exceeds the configured limit"),
             Self::InvalidCredential => write!(f, "decoded credential is not authentic"),
+            Self::UnsupportedVersion => write!(f, "unsupported VOLE-ACT wire-format version"),
         }
     }
 }
@@ -50,6 +55,7 @@ pub(crate) fn header(
     settlement: u8,
 ) {
     out.extend_from_slice(MAGIC);
+    out.push(WIRE_VERSION);
     out.extend_from_slice(&[artifact, parameter_set, credential_kind, settlement]);
 }
 
@@ -90,6 +96,9 @@ impl<'a> Decoder<'a> {
         let mut decoder = Self { input, offset: 0 };
         if decoder.take(MAGIC.len())? != MAGIC {
             return Err(WireError::InvalidEncoding);
+        }
+        if decoder.u8()? != WIRE_VERSION {
+            return Err(WireError::UnsupportedVersion);
         }
         let actual = decoder.array::<4>()?;
         if actual != [artifact, parameter_set, credential_kind, settlement] {

@@ -330,6 +330,10 @@ ell_hat = ell + d*lambda
 bits. The first `ell` carry the witness; `(d-1)lambda` bits mask QuickSilver
 coefficients; the final `lambda` bits mask the wide consistency hash.
 
+Every proof carries a fresh `2*lambda`-bit salt (FAEST's salt width), bound
+into every tree PRG/hash call and diversified per tree, so multi-instance
+attacks on the `lambda`-bit seeds get no batching advantage.
+
 Transcript order is:
 
 ```text
@@ -482,9 +486,9 @@ All built-in VOLE profiles use `tau*k = 128`:
 
 | Profile | `tau` | `k` | Direct-input proof | Deferred-input proof |
 |---|---:|---:|---:|---:|
-| Compact | 16 | 8 | 52,672 bytes | 72,256 bytes |
-| Balanced (default) | 32 | 4 | 101,216 bytes | 140,384 bytes |
-| Low latency | 64 | 2 | 198,304 bytes | 276,640 bytes |
+| Compact | 16 | 8 | 52,688 bytes | 72,272 bytes |
+| Balanced (default) | 32 | 4 | 101,232 bytes | 140,400 bytes |
+| Low latency | 64 | 2 | 198,320 bytes | 276,656 bytes |
 
 Compact minimizes communication but expands 4,096 leaves. Balanced expands
 512. Low latency expands 256 but sends many more correction bits. Run

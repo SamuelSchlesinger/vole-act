@@ -215,12 +215,17 @@ pub fn sample_solution(a: &Mat, y: &[GF16], r: &[GF16]) -> Option<Vec<GF16>> {
 
     // Mask helpers return one-bit values. Matrix dimensions are public and
     // far below the top bit of usize, so wrapping-subtraction comparison is
-    // unambiguous on every supported target.
-    let ct_is_zero =
-        |value: usize| -> u8 { (((value | value.wrapping_neg()) >> (usize::BITS - 1)) ^ 1) as u8 };
+    // unambiguous on every supported target. Each result passes through
+    // `black_box` so the optimizer cannot prove the value is 0/1 and
+    // re-derive a branch from it; this is a best-effort barrier, not a
+    // machine-code guarantee (see SECURITY.md B4).
+    let ct_is_zero = |value: usize| -> u8 {
+        core::hint::black_box((((value | value.wrapping_neg()) >> (usize::BITS - 1)) ^ 1) as u8)
+    };
     let ct_eq = |left: usize, right: usize| -> u8 { ct_is_zero(left ^ right) };
-    let ct_lt =
-        |left: usize, right: usize| -> u8 { (left.wrapping_sub(right) >> (usize::BITS - 1)) as u8 };
+    let ct_lt = |left: usize, right: usize| -> u8 {
+        core::hint::black_box((left.wrapping_sub(right) >> (usize::BITS - 1)) as u8)
+    };
     let gf_nonzero = |value: GF16| -> u8 {
         let value = value.to_u8() as usize;
         1 ^ ct_is_zero(value)

@@ -261,6 +261,7 @@ name = "vector-commit"
 version = "0.1.0"
 dependencies = [
  "sha3",
+ "zeroize",
 ]
 
 [[package]]
@@ -303,6 +304,7 @@ dependencies = [
  "rand_core",
  "sha3",
  "vector-commit",
+ "zeroize",
 ]
 
 [[package]]

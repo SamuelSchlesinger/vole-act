@@ -68,9 +68,10 @@ fuzz_target!(|data: &[u8]| {
     // GGM boundary depths, positions, salts, and tampered openings.
     let depth = u32::from(data.get(2).copied().unwrap_or(0) % 8 + 1);
     let mut root = [0u8; 16];
-    let mut salt = [0u8; 16];
+    let mut salt = [0u8; 32];
     root.copy_from_slice(&a.to_bytes());
-    salt.copy_from_slice(&b.to_bytes());
+    salt[..16].copy_from_slice(&b.to_bytes());
+    salt[16..].copy_from_slice(&c.to_bytes());
     let (tree, commitment) = AllButOneVc::commit(root, salt, depth).unwrap();
     let hide = common::read_u64(data.get(64..).unwrap_or_default()) as usize % tree.num_leaves();
     let opening = tree.open_all_but_one(hide).unwrap();

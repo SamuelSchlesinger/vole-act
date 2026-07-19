@@ -192,6 +192,46 @@ The versioned wrapper domain is now short enough that the largest supported
 message is 131 bytes, and a regression test pins that bound below SHAKE256's
 136-byte rate.
 
+### F6. Secret heap temporaries escaped zeroization (medium)
+
+A second review pass found `Vec`-typed secrets freed without wiping, outside
+the `Mat`/struct zeroization added in F2:
+
+- in `spre`, the `O·x_i` products (whose freed-heap copies, combined with the
+  public oil block `x_i`, give linear equations on the oil space), the
+  `v_i^T L_a` rows, the vinegar quadratic values, and the system-matrix
+  column staging buffers;
+- the secret-key nibble staging buffer on `SecretKey::from_bytes` error
+  paths;
+- on the prover side, the GGM tree levels, root seeds, per-tree `u` vectors,
+  tag planes, `u`/tags on early-error paths, recorded QuickSilver constraint
+  data, mask VOLEs, and raw per-constraint coefficients.
+
+All of these are now wrapped in `Zeroizing` or wiped by `Drop`
+implementations (`AllButOneVc`, `ProverVole`, `ProverBackend`). Circuit-level
+expression temporaries inside the Keccak evaluation remain best-effort (see
+B4): wiping every intermediate polynomial buffer would multiply prover
+allocations, and stack/register copies are outside a source-level guarantee
+anyway.
+
+### F7. Format-hardening pass (low)
+
+Four low-severity items were fixed together, all changing the draft wire or
+transcript format in place (nothing had shipped):
+
+- the per-proof salt widened from 128 to 256 bits (FAEST's `2λ` width), so
+  multi-instance attacks on the 128-bit tree seeds get no batching
+  advantage;
+- `challenge_bytes` now binds its output length and uses a domain tag
+  distinct from the challenge XOF, removing a prefix-collision footgun;
+- wire and proof decoders parse the version byte separately from the magic
+  and return a distinguishable `UnsupportedVersion` error;
+- the application context is bounded (4 KiB) at key generation and both key
+  decoders, so every constructible issuer key round-trips through its own
+  codec; `BitVec` bounds checks are hard asserts in release builds; and a
+  known-answer test pins the exact embedding constant β (its three property
+  tests could not distinguish the four conjugate roots).
+
 ## 6. Unresolved blockers
 
 ### B1. No reduction for the exact VOLE proof (high)
@@ -221,11 +261,14 @@ cannot yet serve as an end-to-end byte oracle.
 
 ### B4. Complete constant-time behavior is unverified (medium)
 
-Issuer signing was hardened, but no dudect, ctgrind, compiler-level audit,
-power analysis, or fault campaign was run. The client-side prover still has
-secret-dependent source branches in satisfaction bookkeeping and VOLE mask
-construction. This matters if a client proves in a hostile co-tenant or device
-environment.
+Issuer signing was hardened, and the solver's one-bit masks now pass through
+`core::hint::black_box` so the optimizer cannot trivially re-derive branches
+from them — but no dudect, ctgrind, compiler-level audit, power analysis, or
+fault campaign was run, and `black_box` is best-effort, not a guarantee. The
+client-side prover still has secret-dependent source branches in satisfaction
+bookkeeping and VOLE mask construction, and its circuit-level expression
+temporaries are not zeroized (F6). This matters if a client proves in a
+hostile co-tenant or device environment.
 
 ### B5. Fault and randomness robustness is incomplete (medium)
 
