@@ -62,7 +62,7 @@ assumptions (an adaptive one-more-preimage property of the whipped map; an
 ideal-XOF model) and its concrete attack ceilings explicitly. A Rust
 research prototype achieves 19--20\,ms proving and 6.5--8\,ms issuer
 verify-and-sign (proof verification plus MAYO preimage sampling) per spend,
-with 53\,KiB proofs and 283-byte tokens.
+with 52\,KiB proofs and 283-byte tokens.
 \end{abstract}
 
 \section{Introduction}
@@ -155,7 +155,7 @@ ceilings --- including a $2^{256/3}$-query quantum collision bound on the
 credential digest.
 (5)~Evidence of practicality: a Rust research prototype
 (Section~\ref{sec:performance}) with 19--20\,ms spend proving, 6.5--8\,ms
-issuer verify-and-sign, 53\,KiB compact proofs, and 283-byte tokens.
+issuer verify-and-sign, 52\,KiB compact proofs, and 283-byte tokens.
 
 \section{Preliminaries}
 
@@ -317,8 +317,10 @@ not-yet-spent node, with amounts respecting balances. The scheme is correct
 if, except with negligible probability, no honest operation aborts, every
 client-side authentication check passes, every output balance obeys the
 equations of Definition~\ref{def:syntax}, distinct accepted inputs yield
-distinct nullifiers, and exact retransmission of a request returns the
-stored response rather than a new node.
+distinct nullifiers, and exact retransmission of a \emph{spend} request
+returns the stored response rather than a new node (issuance carries no
+retry cache: an accepted re-issuance resamples the preimage, but the
+opening and nullifier are unchanged, so no new lineage arises).
 \end{definition}
 
 \begin{definition}[Fiscal soundness]
@@ -441,15 +443,17 @@ $\mathrm{Adv}^{\mathrm{anon}}_{\Pi,\adv}(\lambda) :=
  (h_0, h_1, s, \mathsf{mode}) \sample \adv^{\mathsf{oClientOp}}() \\
  \pcif \neg\mathsf{ValidChallenge}(h_0, h_1, s, \mathsf{mode}):
    \text{abort} \\
+ \mathsf{retire}(h_0); \; \mathsf{retire}(h_1)
+   \quad \pccomment{retired before the challenge session, so no oracle
+   can touch them concurrently} \\
  \text{run the honest client side of the mode-}\mathsf{mode}
    \text{ spend of amount } s \text{ on } \mathcal{T}[h_\beta], \\
  \pcind \text{with } \adv \text{ as issuer; } \adv \text{ sees the
    transcript, and may abort the session} \\
+ \pcind \pccomment{an issuer-induced challenge abort stays in the game} \\
  \pcif \text{the session accepts:} \quad
    \mathsf{spent}[h_\beta] \gets 1; \text{ store the successor at a
    fresh handle } h^\ast; \; \mathsf{retire}(h^\ast) \\
- \mathsf{retire}(h_0); \; \mathsf{retire}(h_1)
-   \quad \pccomment{an issuer-induced challenge abort stays in the game} \\
  \beta' \sample \adv^{\mathsf{oClientOp}}();
    \quad \pcif \beta' \notin \{0,1\}: \beta' \sample \{0,1\} \\
  \pcreturn [\beta' = \beta]}
@@ -779,11 +783,12 @@ interfaces. $\mathsf{digest}(\ctx, \mathit{req}) =
  (\Cred, \_) \gets \mathsf{CredStream}_{\ctx}(\kappa, b, \rho) \\
  \pi \sample \Pi.\mathsf{Prove}(\mathcal{R}_{\mathsf{issue}},
    (\ctx, b, \Cred), (\kappa, \rho)) \\
- \pcreturn (\mathit{req} = (b, \Cred, \pi),\;
+ \pcreturn (\mathit{req} = (\Cred, \pi),\;
    \mathit{st} = (\kappa, b, \rho, \Cred))}
 \pchspace
-\procedure{$\mathsf{Issue.Issuer}(\mathsf{sk}, \ctx, (b, \Cred, \pi))$}{%
- \text{require external authorization for } b \\
+\procedure{$\mathsf{Issue.Issuer}(\mathsf{sk}, \ctx, b, (\Cred, \pi))$}{%
+ \pccomment{$b$ is the externally authorized session input, not part of
+   the request} \\
  \text{require } \Pi.\mathsf{Verify}(\mathcal{R}_{\mathsf{issue}},
    (\ctx, b, \Cred), \pi) \\
  \pcreturn \sigma \sample \Spre(\mathsf{sk}, \Cred)}
@@ -1105,7 +1110,7 @@ collision ceiling).
 (3)~Hashing the compact public-key encoding (rather than the expanded forms)
 into the context --- a transcript-breaking cleanup best done before any
 format freeze.
-(4)~Aggregating or compressing spend proofs; at 53\,KiB the compact profile
+(4)~Aggregating or compressing spend proofs; at 52\,KiB the compact profile
 is deployable server-side but remains the dominant bandwidth cost.
 (5)~Hidden spend amounts, which would require in-circuit range checks and
 re-open the balance-width trade-off.
