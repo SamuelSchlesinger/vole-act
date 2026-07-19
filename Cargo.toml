@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/binary-fields",
     "crates/vector-commit",
+    "crates/voleith",
     "crates/vole-act",
 ]
 
@@ -15,6 +16,7 @@ license = "MIT OR Apache-2.0"
 # Internal crates
 binary-fields = { path = "crates/binary-fields" }
 vector-commit = { path = "crates/vector-commit" }
+voleith = { path = "crates/voleith" }
 
 # External
 rand_core = "0.6.4"
@@ -29,6 +31,19 @@ missing_docs = "warn"
 
 [profile.release]
 lto = "thin"
+
+# Keep the crypto fast even in debug test runs.
+[profile.dev.package.sha3]
+opt-level = 3
+
+[profile.dev.package.binary-fields]
+opt-level = 3
+
+[profile.dev.package.vector-commit]
+opt-level = 3
+
+[profile.dev.package.voleith]
+opt-level = 3
 
 [profile.bench]
 debug = true
