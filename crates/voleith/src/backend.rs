@@ -115,6 +115,57 @@ pub trait Circuit {
     fn build<B: Backend>(&self, backend: &mut B) -> Result<(), VoleithError>;
 }
 
+/// Per-equation GF(16) coefficients of one quadratic term, viewed inside a
+/// shared reference-counted buffer.
+///
+/// Coefficient tables are *public* data — expanded public-key material and
+/// public selector constants — so one arena is shared by every term of a
+/// system (and across proof runs) instead of allocating per term, and the
+/// coefficients are deliberately excluded from constraint zeroization.
+#[derive(Clone)]
+pub struct SharedCoeffs {
+    buf: std::sync::Arc<[GF16]>,
+    start: usize,
+    len: usize,
+}
+
+impl SharedCoeffs {
+    /// View `buf[start..start + len]`; `None` when out of bounds.
+    #[must_use]
+    pub fn new(buf: std::sync::Arc<[GF16]>, start: usize, len: usize) -> Option<Self> {
+        (start.checked_add(len)? <= buf.len()).then_some(SharedCoeffs { buf, start, len })
+    }
+
+    /// A whole-buffer view of an owned coefficient vector.
+    #[must_use]
+    pub fn from_vec(coeffs: Vec<GF16>) -> Self {
+        let len = coeffs.len();
+        SharedCoeffs {
+            buf: coeffs.into(),
+            start: 0,
+            len,
+        }
+    }
+
+    /// The coefficients.
+    #[must_use]
+    pub fn as_slice(&self) -> &[GF16] {
+        &self.buf[self.start..self.start + self.len]
+    }
+
+    /// Number of coefficients.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the view is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
 /// One product term of a quadratic system: contributes
 /// `embed(coeffs[e])·a·b` to equation `e` of the system.
 pub struct QuadTerm<W> {
@@ -124,7 +175,7 @@ pub struct QuadTerm<W> {
     pub b: W,
     /// Per-equation GF(16) coefficients (`coeffs.len()` = number of
     /// equations in the system).
-    pub coeffs: Vec<GF16>,
+    pub coeffs: SharedCoeffs,
 }
 
 /// The interface circuits are written against.
@@ -234,19 +285,21 @@ pub struct ProverExpr {
 /// Prover-side stored quadratic system (values and tags of every term).
 pub struct ProverQuadSystem {
     /// Per term: `(value_a, tag_a, value_b, tag_b, coeffs)`.
-    terms: Vec<(GF2p128, GF2p128, GF2p128, GF2p128, Vec<GF16>)>,
+    terms: Vec<(GF2p128, GF2p128, GF2p128, GF2p128, SharedCoeffs)>,
     /// Per equation: `(value, tag)` of the linear wire.
     linear: Vec<(GF2p128, GF2p128)>,
 }
 
 impl Zeroize for ProverQuadSystem {
     fn zeroize(&mut self) {
-        for (value_a, tag_a, value_b, tag_b, coeffs) in self.terms.iter_mut() {
+        // The coefficient views are shared *public* data (public-key material
+        // and public selectors) and are intentionally not wiped; the secret
+        // witness values and VOLE tags are.
+        for (value_a, tag_a, value_b, tag_b, _coeffs) in self.terms.iter_mut() {
             value_a.zeroize();
             tag_a.zeroize();
             value_b.zeroize();
             tag_b.zeroize();
-            coeffs.zeroize();
         }
         for (value, tag) in self.linear.iter_mut() {
             value.zeroize();
@@ -273,7 +326,7 @@ impl ProverQuadSystem {
         let mut a1 = GF2p128::ZERO;
         let mut value = GF2p128::ZERO;
         for (va, ta, vb, tb, coeffs) in &self.terms {
-            let c = fold_coeff(&tables, coeffs);
+            let c = fold_coeff(&tables, coeffs.as_slice());
             a0 += c * (*ta * *tb);
             a1 += c * (*va * *tb + *vb * *ta);
             value += c * (*va * *vb);
@@ -482,7 +535,7 @@ pub enum VerifierConstraint {
 /// Verifier-side stored quadratic system (keys of every term).
 pub struct VerifierQuadSystem {
     /// Per term: `(key_a, key_b, coeffs)`.
-    terms: Vec<(GF2p128, GF2p128, Vec<GF16>)>,
+    terms: Vec<(GF2p128, GF2p128, SharedCoeffs)>,
     /// Per equation: key of the linear wire.
     linear: Vec<GF2p128>,
 }
@@ -502,7 +555,7 @@ impl VerifierQuadSystem {
         let tables: Vec<[GF2p128; 16]> = phis.iter().map(|&p| fold_table(p)).collect();
         let mut b = GF2p128::ZERO;
         for (ka, kb, coeffs) in &self.terms {
-            let c = fold_coeff(&tables, coeffs);
+            let c = fold_coeff(&tables, coeffs.as_slice());
             b += c * (*ka * *kb);
         }
         let mut lin = GF2p128::ZERO;

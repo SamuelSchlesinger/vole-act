@@ -99,7 +99,9 @@ fn main() {
         );
         add(
             "spend(direct)/client-prove",
-            time(ITERS, || direct.prepare_spend(&public, 20, &mut rng).unwrap()),
+            time(ITERS, || {
+                direct.prepare_spend(&public, 20, &mut rng).unwrap()
+            }),
         );
         add(
             "spend(direct)/issuer-verify-and-sign",
@@ -153,7 +155,10 @@ fn main() {
         add_size("deferred-return token", deferred.to_bytes().len());
         add_size("issue request", issue_request.to_bytes().len());
         add_size("issue response", issue_response.to_bytes().len());
-        add_size("spend request (direct input)", direct_request.to_bytes().len());
+        add_size(
+            "spend request (direct input)",
+            direct_request.to_bytes().len(),
+        );
         add_size(
             "spend request (deferred input)",
             deferred_input_request.to_bytes().len(),

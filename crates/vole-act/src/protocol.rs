@@ -13,8 +13,8 @@
 //! the same transaction boundary.
 
 use crate::circuit::{
-    InputCredentialKind, IssueCircuit, MayoTerm, SpendCircuit, SpendSecrets, credential_target,
-    derive_nullifier, mayo_terms_and_hash, signed_token_target,
+    InputCredentialKind, IssueCircuit, MayoTermTable, SpendCircuit, SpendSecrets,
+    credential_target, derive_nullifier, mayo_terms_and_hash, signed_token_target,
 };
 use crate::wire::{self, Decoder, WireError};
 use binary_fields::GF16;
@@ -245,7 +245,7 @@ fn signing_target<P: MayoParams, K: CredentialKind>(
 
 struct PublicInner<P: MayoParams> {
     mayo: MayoPublicKey<P>,
-    terms: Vec<MayoTerm>,
+    terms: MayoTermTable,
     context: [u8; 32],
     profile: PerformanceProfile,
     application_context: Vec<u8>,

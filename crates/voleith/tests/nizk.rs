@@ -363,7 +363,7 @@ struct SystemCircuit {
 
 impl Circuit for SystemCircuit {
     fn build<B: Backend>(&self, backend: &mut B) -> Result<(), VoleithError> {
-        use voleith::QuadTerm;
+        use voleith::{QuadTerm, SharedCoeffs};
         let mut xy_bits = Vec::with_capacity(8);
         for _ in 0..8 {
             xy_bits.push(backend.witness_bit()?);
@@ -398,12 +398,12 @@ impl Circuit for SystemCircuit {
                 QuadTerm {
                     a: x.clone(),
                     b: y,
-                    coeffs: vec![GF16::ONE, GF16::ZERO],
+                    coeffs: SharedCoeffs::from_vec(vec![GF16::ONE, GF16::ZERO]),
                 },
                 QuadTerm {
                     a: x.clone(),
                     b: x,
-                    coeffs: vec![GF16::ZERO, GF16::ONE],
+                    coeffs: SharedCoeffs::from_vec(vec![GF16::ZERO, GF16::ONE]),
                 },
             ],
             vec![lin0, lin1],

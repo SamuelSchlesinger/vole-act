@@ -12,7 +12,7 @@ use crate::keccak::{self, RATE_BYTES, RC, RHO, State};
 use binary_fields::{BinaryField, GF2p128, GF16, embed_gf16};
 use mayo::{MayoParams, PublicKey as MayoPublicKey};
 use std::marker::PhantomData;
-use voleith::{Backend, Circuit, QuadTerm, VoleithError};
+use voleith::{Backend, Circuit, QuadTerm, SharedCoeffs, VoleithError};
 
 pub(crate) const CRED_DOMAIN: &[u8] = b"VOLE-ACT/credential/v2";
 // Keep the wrapper below one SHAKE256 rate block even for MAYO5's 71-byte
@@ -30,16 +30,27 @@ pub(crate) enum InputCredentialKind {
     DeferredReturn,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub(crate) struct MayoTerm {
     pub r: usize,
     pub c: usize,
-    pub coeffs: Vec<GF16>,
+    /// Offset of this term's `m` per-equation coefficients inside the shared
+    /// arena of [`MayoTermTable::coeffs`].
+    pub offset: usize,
+}
+
+/// The whipped-MAYO quadratic system as circuit terms: one shared coefficient
+/// arena (public data) plus per-term index entries. Derived once per public
+/// key; circuit builds hand out `Arc` views instead of cloning coefficients.
+#[derive(Clone)]
+pub(crate) struct MayoTermTable {
+    pub terms: Vec<MayoTerm>,
+    pub coeffs: std::sync::Arc<[GF16]>,
 }
 
 pub(crate) fn mayo_terms_and_hash<P: MayoParams>(
     pk: &MayoPublicKey<P>,
-) -> (Vec<MayoTerm>, [u8; 32]) {
+) -> (MayoTermTable, [u8; 32]) {
     use sha3::digest::{ExtendableOutput, Update, XofReader};
 
     let forms = pk.whipped_forms();
@@ -59,6 +70,7 @@ pub(crate) fn mayo_terms_and_hash<P: MayoParams>(
     h.finalize_xof().read(&mut public_key_hash);
 
     let mut terms = Vec::new();
+    let mut flat: Vec<GF16> = Vec::new();
     let kn = P::KN;
     for r in 0..kn {
         let rows: Vec<&[GF16]> = forms
@@ -66,13 +78,22 @@ pub(crate) fn mayo_terms_and_hash<P: MayoParams>(
             .map(|form| &form.entries()[r * kn..(r + 1) * kn])
             .collect();
         for c in r..kn {
-            let coeffs: Vec<GF16> = rows.iter().map(|row| row[c]).collect();
-            if coeffs.iter().any(|coeff| *coeff != GF16::ZERO) {
-                terms.push(MayoTerm { r, c, coeffs });
+            let offset = flat.len();
+            flat.extend(rows.iter().map(|row| row[c]));
+            if flat[offset..].iter().any(|coeff| *coeff != GF16::ZERO) {
+                terms.push(MayoTerm { r, c, offset });
+            } else {
+                flat.truncate(offset);
             }
         }
     }
-    (terms, public_key_hash)
+    (
+        MayoTermTable {
+            terms,
+            coeffs: flat.into(),
+        },
+        public_key_hash,
+    )
 }
 
 pub(crate) fn credential_message(
@@ -439,6 +460,7 @@ fn assert_u64_sum<B: Backend>(
     for bit in 0..BALANCE_BITS {
         let mut coefficient = vec![GF16::ZERO; BALANCE_BITS];
         coefficient[bit] = GF16::ONE;
+        let coefficient = SharedCoeffs::from_vec(coefficient);
         terms.push(QuadTerm {
             a: a[bit].clone(),
             b: b[bit].clone(),
@@ -494,7 +516,7 @@ impl<P: MayoParams> Circuit for IssueCircuit<P> {
 }
 
 pub(crate) struct SpendCircuit<'a, P: MayoParams> {
-    pub terms: &'a [MayoTerm],
+    pub terms: &'a MayoTermTable,
     pub context: [u8; 32],
     pub spend: u64,
     pub nullifier: [u8; 32],
@@ -679,11 +701,13 @@ impl<P: MayoParams> Circuit for SpendCircuit<'_, P> {
 
         let mayo_terms = self
             .terms
+            .terms
             .iter()
             .map(|term| QuadTerm {
                 a: signature[term.r].clone(),
                 b: signature[term.c].clone(),
-                coeffs: term.coeffs.clone(),
+                coeffs: SharedCoeffs::new(self.terms.coeffs.clone(), term.offset, P::M)
+                    .expect("term offsets index the shared arena"),
             })
             .collect();
         backend.assert_quad_system(mayo_terms, signed_target);

@@ -24,7 +24,9 @@ pub mod proof;
 pub mod transcript;
 pub mod vole;
 
-pub use backend::{Backend, Circuit, CountingBackend, ProverBackend, QuadTerm, VerifierBackend};
+pub use backend::{
+    Backend, Circuit, CountingBackend, ProverBackend, QuadTerm, SharedCoeffs, VerifierBackend,
+};
 pub use proof::{MAX_PROOF_WIRE_BYTES, Proof, ProofDecodeError, prove, verify};
 pub use vole::{PARAMS_128, PARAMS_128_BALANCED, PARAMS_128_FAST, Params};
 
