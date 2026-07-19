@@ -7,6 +7,7 @@
 \usepackage{xcolor}
 \definecolor{linkblue}{RGB}{25,60,120}
 \usepackage[operators]{cryptocode}
+\usepackage{placeins}
 \usepackage[colorlinks=true,linkcolor=linkblue,citecolor=linkblue,urlcolor=linkblue]{hyperref}
 
 \newtheorem{definition}{Definition}
@@ -258,10 +259,18 @@ terms (Section~\ref{sec:quadsys}).
 \label{sec:definitions}
 
 We state the syntax and the security games the eventual analysis must
-target. The games are given at a semi-formal level: they pin down the
-adversary's interfaces, win conditions, and the leakage the definitions
-deliberately permit; a fully formal treatment (in particular of concurrent
-sessions and adaptive corruptions) is left to the reduction effort.
+target; a fully formal treatment of concurrent sessions and adaptive
+corruptions is left to the reduction effort. Throughout the experiments:
+the application label $\mathsf{app}$ and the parameter, profile, and
+balance-width identifiers are fixed public constants; $\mathsf{KGen}$ is
+MAYO trapdoor generation; $\mathsf{CanonParse}$ is the scheme's canonical
+public-key decoder, returning $\bot$ on any non-canonical encoding; and
+$\mathsf{DeriveCtx}(\mathsf{pk})$ is $\mathsf{Setup}$'s context derivation
+applied to those constants and $\mathsf{pk}$. The maps $\Cred$, $\Def$,
+$\mathsf{digest}$, and $\mathsf{DeriveCtx}$ are all defined over one
+shared prefix-consistent ideal XOF $\mathcal{H}$
+(Remark~\ref{rem:xof}), which every experiment implicitly samples and
+provides to all parties, including the adversary.
 
 \begin{definition}[Anonymous credit token scheme]
 \label{def:syntax}
@@ -322,7 +331,7 @@ $\mathrm{Adv}^{\mathrm{fiscal}}_{\Pi,\adv}(\lambda) :=
 is negligible.
 \end{definition}
 
-\begin{figure}[t]
+\begin{figure}[!ht]
 \centering
 \begin{pcvstack}[boxed]
 \procedure{$\mathrm{Exp}^{\mathrm{fiscal}}_{\Pi,\adv}(\lambda)$}{%
@@ -341,9 +350,11 @@ is negligible.
    I \gets I + b; \; \pcreturn \text{its response} \\
  \pcreturn \bot}
 \pcvspace
-\procedure{$\mathsf{oSpend}(\mathit{req})
-  \quad \pccomment{req carries nullifier $\Null$, amount $s$; let
-  $\mathit{dig} = \mathsf{digest}(\ctx, \mathit{req})$}$}{%
+\procedure{$\mathsf{oSpend}(\mathit{req})$}{%
+ \pcif \mathit{req} \text{ does not parse as a typed ordinary-settlement
+   request:} \pcreturn \bot \\
+ (\Null, s) \gets \text{its nullifier and amount}; \quad
+   \mathit{dig} \gets \mathsf{digest}(\ctx, \mathit{req}) \\
  \pcif \mathsf{St}[\Null] = (\mathit{dig}', \mathit{resp}')
    \text{ exists:} \\
  \pcind \pcif \mathit{dig}' = \mathit{dig}: \pcreturn \mathit{resp}'
@@ -360,10 +371,24 @@ is negligible.
  \pcreturn \mathit{resp}}
 \pcvspace
 \procedure{$\mathsf{oSpendDef}(\mathit{req}, t')$}{%
- \text{as } \mathsf{oSpend}, \text{ except: require } t' \le s;\;
-   \mathit{resp} \text{ records } t';\; R \gets R + s - t' \\
- \pccomment{an exact retry replays the stored response, including the
-   original $t'$}}
+ \pcif \mathit{req} \text{ does not parse as a typed deferred-settlement
+   request:} \pcreturn \bot \\
+ (\Null, s) \gets \text{its nullifier and amount}; \quad
+   \mathit{dig} \gets \mathsf{digest}(\ctx, \mathit{req}) \\
+ \pcif \mathsf{St}[\Null] = (\mathit{dig}', \mathit{resp}')
+   \text{ exists:} \\
+ \pcind \pcif \mathit{dig}' = \mathit{dig}: \pcreturn \mathit{resp}'
+   \quad \pccomment{exact retry replays the stored $t'$; accounting
+   unchanged} \\
+ \pcind \pcreturn \bot \\
+ \pcif \text{issuer verification of } \mathit{req} \text{ fails}
+   \;\vee\; \neg(0 \le t' \le s): \pcreturn \bot \\
+ \mathit{resp} \gets \text{issuer response on the deferred target,
+   recording } t' \\
+ \mathsf{St}[\Null] \gets (\mathit{dig}, \mathit{resp}); \quad
+   R \gets R + s - t' \\
+ \pcif R > I: \mathsf{win} \gets 1 \\
+ \pcreturn \mathit{resp}}
 \end{pcvstack}
 \caption{The fiscal-soundness experiment. Accounting is per logical spend
 event (first durable consumption of a nullifier); letting $\adv$ choose
@@ -377,7 +402,7 @@ The win condition counts only \emph{redeemed} value, not outstanding
 spendable balances, so an attack that merely \emph{forks} a token into two
 live successors has not yet won. It extends to a win at will: any
 adversary holding more spendable value than the invariant allows simply
-continues querying $\mathsf{SPEND}$ to cash the excess out, and the game
+continues querying $\mathsf{oSpend}$ to cash the excess out, and the game
 runs for the whole experiment. Formally, redemption-only soundness is
 equivalent to the ledger invariant of the design document
 (redeemed value $+$ live independently spendable value $\le$ issued value)
@@ -389,15 +414,19 @@ should prove as a lemma rather than assume.
 \label{def:anon}
 For a scheme $\Pi$ and adversary $\adv$ (a malicious issuer), the
 experiment $\mathrm{Exp}^{\mathrm{anon}}_{\Pi,\adv}(\lambda)$ of
-Figure~\ref{fig:anon} is defined with the convention that an aborting run
-outputs a uniformly random bit, so degenerate strategies gain nothing.
+Figure~\ref{fig:anon} is defined with the convention that the experiment's
+explicit abort steps (an invalid public key or an invalid challenge
+selection) output a uniformly random bit, so degenerate strategies gain
+nothing; a malformed final guess is likewise replaced by a fresh coin.
+Aborts the adversary induces \emph{inside} protocol sessions are not
+experiment aborts.
 $\Pi$ is \emph{spend-anonymous} if for every efficient $\adv$,
 $\mathrm{Adv}^{\mathrm{anon}}_{\Pi,\adv}(\lambda) :=
 \bigl|\Pr[\mathrm{Exp}^{\mathrm{anon}}_{\Pi,\adv}(\lambda) = 1] -
 \tfrac{1}{2}\bigr|$ is negligible.
 \end{definition}
 
-\begin{figure}[t]
+\begin{figure}[!ht]
 \centering
 \begin{pcvstack}[boxed]
 \procedure{$\mathrm{Exp}^{\mathrm{anon}}_{\Pi,\adv}(\lambda)$}{%
@@ -414,33 +443,52 @@ $\mathrm{Adv}^{\mathrm{anon}}_{\Pi,\adv}(\lambda) :=
  \text{run the honest client side of the mode-}\mathsf{mode}
    \text{ spend of amount } s \text{ on } \mathcal{T}[h_\beta], \\
  \pcind \text{with } \adv \text{ as issuer; } \adv \text{ sees the
-   transcript (including any abort it induces);} \\
- \pcind \text{on acceptance store the successor at fresh handle }
-   h^\ast \\
- \mathsf{retire}(h_0); \; \mathsf{retire}(h_1); \;
-   \mathsf{retire}(h^\ast) \\
- \beta' \sample \adv^{\mathsf{oClientOp}}() \\
+   transcript, and may abort the session} \\
+ \pcif \text{the session accepts:} \quad
+   \mathsf{spent}[h_\beta] \gets 1; \text{ store the successor at a
+   fresh handle } h^\ast; \; \mathsf{retire}(h^\ast) \\
+ \mathsf{retire}(h_0); \; \mathsf{retire}(h_1)
+   \quad \pccomment{an issuer-induced challenge abort stays in the game} \\
+ \beta' \sample \adv^{\mathsf{oClientOp}}();
+   \quad \pcif \beta' \notin \{0,1\}: \beta' \sample \{0,1\} \\
  \pcreturn [\beta' = \beta]}
 \pcvspace
 \procedure{$\mathsf{oClientOp}(\mathsf{op}, h, \mathit{args})$}{%
- \text{run the honest client side of } \mathsf{op} \in
-   \{\mathsf{Issue}, \mathsf{Spend}, \mathsf{SpendDeferred}\} \\
- \pcind \text{on the (unretired) token } \mathcal{T}[h] \text{ where
-   required, with } \adv \text{ as issuer,} \\
+ \pcif \mathsf{op} \notin
+   \{\mathsf{Issue}, \mathsf{Spend}, \mathsf{SpendDeferred}\}:
+   \pcreturn \bot \\
+ \pcif \mathsf{op} \ne \mathsf{Issue} \wedge
+   (h \notin \mathcal{T} \vee \mathsf{retired}[h] \vee
+   \mathsf{spent}[h]): \pcreturn \bot \\
+ \text{run the honest client side of } \mathsf{op}
+   \text{ on } \mathcal{T}[h] \text{ where required, with } \adv
+   \text{ as issuer,} \\
  \pcind \text{performing every client-side authentication check} \\
- \pcif \text{the session accepts: store any output token at a fresh
-   handle; } \pcreturn \text{it} \\
- \pcreturn \bot \quad \pccomment{aborted sessions yield no token}}
+ \pcif \text{the session accepts:} \\
+ \pcind \pcif \mathsf{op} \ne \mathsf{Issue}:
+   \mathsf{spent}[h] \gets 1 \\
+ \pcind \text{store the output token at a fresh handle } h';
+   \; \pcreturn h' \\
+ \pcreturn \bot \quad \pccomment{aborted sessions yield no token and
+   consume no handle}}
 \pcvspace
 \procedure{$\mathsf{ValidChallenge}(h_0, h_1, s, \mathsf{mode})$}{%
- \pcreturn h_0 \ne h_1 \;\wedge\; \mathcal{T}[h_0], \mathcal{T}[h_1]
-   \text{ exist, unretired, authenticated, unspent} \\
+ \pcreturn \mathsf{mode} \in \{\mathsf{Spend},
+   \mathsf{SpendDeferred}\} \;\wedge\; h_0 \ne h_1 \\
+ \pcind \wedge\; \mathcal{T}[h_0], \mathcal{T}[h_1]
+   \text{ exist, } \neg\mathsf{retired}, \neg\mathsf{spent},
+   \text{ authenticated} \\
  \pcind \wedge\; \text{same credential kind} \;\wedge\;
    \mathsf{bal}(\mathcal{T}[h_0]) = \mathsf{bal}(\mathcal{T}[h_1])
    \;\wedge\; s \text{ valid for both}}
 \end{pcvstack}
 \caption{The single-challenge spend-anonymity experiment against a
-malicious issuer. ``Abort'' outputs a uniformly random bit.}
+malicious issuer. The explicit ``abort'' steps (invalid key, invalid
+challenge selection) output a uniformly random bit; an issuer-induced
+abort of the challenge \emph{session} is ordinary protocol behavior ---
+the transcript stands and $\adv$ still guesses, so selective-failure
+strategies remain in scope. All handle state
+($\mathsf{spent}$, $\mathsf{retired}$) initializes to 0.}
 \label{fig:anon}
 \end{figure}
 
@@ -471,7 +519,7 @@ $\mathrm{Adv}^{\mathrm{omp}}_{\adv}(\lambda) :=
 function of $Q_S$ and $Q_H$).
 \end{assumption}
 
-\begin{figure}[t]
+\begin{figure}[!ht]
 \centering
 \begin{pcvstack}[boxed]
 \procedure{$\mathrm{Exp}^{\mathrm{omp}}_{\adv}(\lambda)$}{%
@@ -493,6 +541,9 @@ function of $Q_S$ and $Q_H$).
  \pccomment{fresh randomness per call}}
 \pchspace
 \procedure{$\mathsf{Adm}(y, w)$}{%
+ \pcif y \notin \Fsixteen^{m}: \pcreturn 0 \\
+ \pccomment{below: $\kappa, \rho \in \{0,1\}^{256}$,
+   $b, t \in \{0, \dots, 2^{64}{-}1\}$} \\
  \pcif w = (\kappa, b, \rho) \wedge y = \Cred(\kappa, b, \rho):
    \pcreturn 1 \\
  \pcif w = (\kappa, b, \rho, t) \\
@@ -547,6 +598,8 @@ ROM; the primitives are post-quantum candidates, but a QROM treatment
 so ``post-quantum'' describes the assumption class, not a proved quantum
 security level.
 \end{remark}
+
+\FloatBarrier
 
 \section{The VOLE-ACT construction}
 \label{sec:scheme}
