@@ -19,6 +19,22 @@ fn word_at(bytes: &[u8], start: usize) -> u64 {
     u64::from_le_bytes(buf)
 }
 
+/// `dst ^= scalar · src`, lane-wise over equal-length GF(16) slices.
+pub(crate) fn packed_axpy(dst: &mut [GF16], scalar: GF16, src: &[GF16]) {
+    assert_eq!(dst.len(), src.len());
+    let dst_bytes = GF16::slice_as_bytes_mut(dst);
+    let src_bytes = GF16::slice_as_bytes(src);
+    let (dst_words, dst_tail) = dst_bytes.as_chunks_mut::<8>();
+    let (src_words, src_tail) = src_bytes.as_chunks::<8>();
+    for (d, s) in dst_words.iter_mut().zip(src_words.iter()) {
+        let w = u64::from_le_bytes(*d) ^ packed::mul_scalar8(u64::from_le_bytes(*s), scalar);
+        *d = w.to_le_bytes();
+    }
+    for (d, s) in dst_tail.iter_mut().zip(src_tail.iter()) {
+        *d ^= (GF16::new(*s) * scalar).to_u8();
+    }
+}
+
 /// A dense row-major matrix over `GF(16)`.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Mat {
@@ -87,6 +103,23 @@ impl Mat {
     #[must_use]
     pub fn cols(&self) -> usize {
         self.cols
+    }
+
+    /// The entries in row-major order (row `r` occupies
+    /// `[r·cols, (r+1)·cols)`).
+    #[must_use]
+    pub fn entries(&self) -> &[GF16] {
+        &self.data
+    }
+
+    /// Row `r` as a slice.
+    pub(crate) fn row(&self, r: usize) -> &[GF16] {
+        &self.data[r * self.cols..(r + 1) * self.cols]
+    }
+
+    /// Row `r` as a mutable slice.
+    pub(crate) fn row_mut(&mut self, r: usize) -> &mut [GF16] {
+        &mut self.data[r * self.cols..(r + 1) * self.cols]
     }
 
     /// Matrix product `self · rhs`.

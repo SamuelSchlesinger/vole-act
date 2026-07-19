@@ -50,19 +50,23 @@ pub(crate) fn mayo_terms_and_hash<P: MayoParams>(
     h.update(&(P::O as u64).to_le_bytes());
     h.update(&(P::K as u64).to_le_bytes());
     for form in &forms {
-        for r in 0..form.rows() {
-            for c in 0..form.cols() {
-                h.update(&[form[(r, c)].to_u8()]);
-            }
-        }
+        // One absorb of the row-major entry bytes per form: the identical
+        // byte stream the per-entry loop produced, minus millions of
+        // single-byte update calls.
+        h.update(GF16::slice_as_bytes(form.entries()));
     }
     let mut public_key_hash = [0u8; 32];
     h.finalize_xof().read(&mut public_key_hash);
 
     let mut terms = Vec::new();
-    for r in 0..P::KN {
-        for c in r..P::KN {
-            let coeffs: Vec<GF16> = forms.iter().map(|form| form[(r, c)]).collect();
+    let kn = P::KN;
+    for r in 0..kn {
+        let rows: Vec<&[GF16]> = forms
+            .iter()
+            .map(|form| &form.entries()[r * kn..(r + 1) * kn])
+            .collect();
+        for c in r..kn {
+            let coeffs: Vec<GF16> = rows.iter().map(|row| row[c]).collect();
             if coeffs.iter().any(|coeff| *coeff != GF16::ZERO) {
                 terms.push(MayoTerm { r, c, coeffs });
             }

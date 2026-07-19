@@ -49,6 +49,16 @@ impl GF16 {
         unsafe { core::slice::from_raw_parts(elems.as_ptr().cast::<u8>(), elems.len()) }
     }
 
+    /// Mutable canonical-byte view of a slice of elements.
+    ///
+    /// Writers must preserve the low-nibble invariant (`byte < 16` for every
+    /// element). All [`packed`] outputs are reduced and satisfy it.
+    #[must_use]
+    pub fn slice_as_bytes_mut(elems: &mut [GF16]) -> &mut [u8] {
+        // SAFETY: `GF16` is `#[repr(transparent)]` over `u8`.
+        unsafe { core::slice::from_raw_parts_mut(elems.as_mut_ptr().cast::<u8>(), elems.len()) }
+    }
+
     /// Carry-less 4×4-bit multiply followed by reduction mod `x⁴ + x + 1`.
     ///
     /// Branch-free: fixed iteration counts, mask-based conditionals.

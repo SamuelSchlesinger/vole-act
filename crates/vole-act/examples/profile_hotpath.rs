@@ -47,6 +47,13 @@ fn main() {
 
     let (_, fixed_request) = direct.prepare_spend(&public, 20, &mut rng).unwrap();
     eprintln!("looping mode={mode}; attach `sample` now");
+    if mode == "pkdecode" {
+        use vole_act::PublicKey;
+        let bytes = public.to_bytes();
+        loop {
+            let _ = std::hint::black_box(PublicKey::<Mayo2>::from_bytes(&bytes).unwrap());
+        }
+    }
     loop {
         if verify_only {
             let _ = issuer.spend(&fixed_request, &mut rng).unwrap();

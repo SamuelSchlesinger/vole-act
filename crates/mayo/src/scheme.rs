@@ -452,13 +452,19 @@ impl<P: MayoParams> PublicKey<P> {
                 .collect()
         };
         let full: Vec<Mat> = (0..m).map(|b| self.full_matrix(b)).collect();
+        // Symmetrized copies `Mb + Mbᵀ`, so every block placement below is a
+        // row-contiguous scalar-multiply-accumulate over packed lanes. The
+        // symmetric matrix has a zero diagonal (characteristic 2), so the
+        // diagonal-block case takes its diagonal from `Mb` directly.
+        let sym: Vec<Mat> = full.iter().map(|mb| mb.add(&mb.transpose())).collect();
 
         let mut g = vec![Mat::zero(kn, kn); m];
         let mut ell = 0;
         for i in 0..k {
             for j in (i..k).rev() {
                 let e_cols = e_pow(ell); // e_cols[b][a] = [E^ℓ]_{a,b}
-                for (b, mb) in full.iter().enumerate() {
+                for b in 0..m {
+                    let (mb, sym_b) = (&full[b], &sym[b]);
                     // Base placement: block (i,j) of the kn×kn form.
                     let (ri0, cj0) = (i * n, j * n);
                     for a in 0..m {
@@ -468,20 +474,27 @@ impl<P: MayoParams> PublicKey<P> {
                         }
                         let ga = &mut g[a];
                         if i == j {
-                            // sᵢᵀ Mb sᵢ → place Upper(coeff·Mb) on the diagonal block.
+                            // sᵢᵀ Mb sᵢ → place Upper(coeff·Mb) on the diagonal
+                            // block: strict upper part from `sym`, diagonal
+                            // from `Mb`.
                             for r in 0..n {
-                                ga[(ri0 + r, ri0 + r)] += coeff * mb[(r, r)];
-                                for c in (r + 1)..n {
-                                    ga[(ri0 + r, ri0 + c)] += coeff * (mb[(r, c)] + mb[(c, r)]);
-                                }
+                                let ga_row = ga.row_mut(ri0 + r);
+                                ga_row[ri0 + r] += coeff * mb[(r, r)];
+                                crate::mat::packed_axpy(
+                                    &mut ga_row[ri0 + r + 1..ri0 + n],
+                                    coeff,
+                                    &sym_b.row(r)[r + 1..n],
+                                );
                             }
                         } else {
                             // sᵢᵀ Mb sⱼ + sⱼᵀ Mb sᵢ = sᵢᵀ(Mb+Mbᵀ)sⱼ → off-diagonal
                             // block (i<j, so already upper-triangular).
                             for r in 0..n {
-                                for c in 0..n {
-                                    ga[(ri0 + r, cj0 + c)] += coeff * (mb[(r, c)] + mb[(c, r)]);
-                                }
+                                crate::mat::packed_axpy(
+                                    &mut ga.row_mut(ri0 + r)[cj0..cj0 + n],
+                                    coeff,
+                                    sym_b.row(r),
+                                );
                             }
                         }
                     }
