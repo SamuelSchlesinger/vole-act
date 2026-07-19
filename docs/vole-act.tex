@@ -669,27 +669,25 @@ low nibble):
 \procedure{$\mathsf{CredStream}_{\ctx}(\kappa, b, \rho)$}{%
  X \gets \mathcal{H}(\text{``credential''} \,\|\, \ctx \,\|\, \kappa
    \,\|\, \enc(b) \,\|\, \rho) \\
- \Cred \gets X[0{:}4m] \text{ as } \Fsixteen^{m}; \quad
-   \Null \gets X[4m{:}4m{+}256] \\
+ \Cred \gets X[0{:}4m] \text{ as } \Fsixteen^{m} \\
+ \Null \gets X[4m{:}4m{+}256] \\
  \pcreturn (\Cred, \Null)}
 \pchspace
-\procedure{$\mathsf{DefTarget}_{\ctx}(\Cred, t)$}{%
- \pcreturn \mathcal{H}(\text{``deferred''} \,\|\, \ctx \,\|\,
-   \mathsf{pack16}(\Cred) \,\|\, \enc(t))[0{:}4m]}
-\end{pchstack}
-\pcvspace
-\begin{pchstack}
 \procedure{$\mathsf{Target}(T)$}{%
  (\Cred, \_) \gets \mathsf{CredStream}_{\ctx_T}(\kappa_T, b_T, \rho_T) \\
  \pcif \mathsf{kind}(T) = \mathsf{Direct}: \pcreturn \Cred \\
  \pcreturn \mathsf{DefTarget}_{\ctx_T}(\Cred, t_T)}
-\pchspace
+\end{pchstack}
+\pcvspace
+\procedure{$\mathsf{DefTarget}_{\ctx}(\Cred, t)$}{%
+ \pcreturn \mathcal{H}(\text{``deferred''} \,\|\, \ctx \,\|\,
+   \mathsf{pack16}(\Cred) \,\|\, \enc(t))[0{:}4m]}
+\pcvspace
 \procedure{$\mathsf{VerifyToken}(\mathsf{pk}, T)$}{%
  \pcif \ctx_T \ne \mathsf{DeriveCtx}(\mathsf{pk}): \pcreturn 0 \\
  \pcif \mathsf{kind}(T) = \mathsf{Direct} \wedge t_T \ne 0: \pcreturn 0 \\
  \pcif b_T + t_T \ge 2^{64}: \pcreturn 0 \\
  \pcreturn [P^\ast(\sigma_T) = \mathsf{Target}(T)]}
-\end{pchstack}
 \end{pcvstack}
 \caption{Helper maps and local token authentication. A token carries the
 tuple $(\mathsf{kind}, \sigma, \kappa, b, \rho, t)$, with $t = 0$ for the
