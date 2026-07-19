@@ -7,6 +7,7 @@
 \usepackage{xcolor}
 \definecolor{linkblue}{RGB}{25,60,120}
 \usepackage[operators]{cryptocode}
+\usepackage{float}
 \usepackage{placeins}
 \usepackage[colorlinks=true,linkcolor=linkblue,citecolor=linkblue,urlcolor=linkblue]{hyperref}
 
@@ -331,7 +332,7 @@ $\mathrm{Adv}^{\mathrm{fiscal}}_{\Pi,\adv}(\lambda) :=
 is negligible.
 \end{definition}
 
-\begin{figure}[!ht]
+\begin{figure}[H]
 \centering
 \begin{pcvstack}[boxed]
 \procedure{$\mathrm{Exp}^{\mathrm{fiscal}}_{\Pi,\adv}(\lambda)$}{%
@@ -426,7 +427,7 @@ $\mathrm{Adv}^{\mathrm{anon}}_{\Pi,\adv}(\lambda) :=
 \tfrac{1}{2}\bigr|$ is negligible.
 \end{definition}
 
-\begin{figure}[!ht]
+\begin{figure}[H]
 \centering
 \begin{pcvstack}[boxed]
 \procedure{$\mathrm{Exp}^{\mathrm{anon}}_{\Pi,\adv}(\lambda)$}{%
@@ -463,21 +464,25 @@ $\mathrm{Adv}^{\mathrm{anon}}_{\Pi,\adv}(\lambda) :=
  \text{run the honest client side of } \mathsf{op}
    \text{ on } \mathcal{T}[h] \text{ where required, with } \adv
    \text{ as issuer,} \\
- \pcind \text{performing every client-side authentication check} \\
+ \pcind \text{performing every client-side authentication check;} \\
+ \pcind \pcif \mathsf{op} \ne \mathsf{Issue}: \text{ set }
+   \mathsf{exposed}[h] \gets 1 \text{ when the spend request is
+   delivered to } \adv \\
  \pcif \text{the session accepts:} \\
  \pcind \pcif \mathsf{op} \ne \mathsf{Issue}:
    \mathsf{spent}[h] \gets 1 \\
  \pcind \text{store the output token at a fresh handle } h';
    \; \pcreturn h' \\
- \pcreturn \bot \quad \pccomment{aborted sessions yield no token and
-   consume no handle}}
+ \pcreturn \bot \quad \pccomment{aborted sessions yield no token, but
+   exposure persists}}
 \pcvspace
 \procedure{$\mathsf{ValidChallenge}(h_0, h_1, s, \mathsf{mode})$}{%
  \pcreturn \mathsf{mode} \in \{\mathsf{Spend},
    \mathsf{SpendDeferred}\} \;\wedge\; h_0 \ne h_1 \\
  \pcind \wedge\; \mathcal{T}[h_0], \mathcal{T}[h_1]
-   \text{ exist, } \neg\mathsf{retired}, \neg\mathsf{spent},
-   \text{ authenticated} \\
+   \text{ exist, } \neg\mathsf{retired}, \neg\mathsf{exposed},
+   \text{ authenticated} \quad \pccomment{$\mathsf{spent} \Rightarrow
+   \mathsf{exposed}$} \\
  \pcind \wedge\; \text{same credential kind} \;\wedge\;
    \mathsf{bal}(\mathcal{T}[h_0]) = \mathsf{bal}(\mathcal{T}[h_1])
    \;\wedge\; s \text{ valid for both}}
@@ -488,7 +493,11 @@ challenge selection) output a uniformly random bit; an issuer-induced
 abort of the challenge \emph{session} is ordinary protocol behavior ---
 the transcript stands and $\adv$ still guesses, so selective-failure
 strategies remain in scope. All handle state
-($\mathsf{spent}$, $\mathsf{retired}$) initializes to 0.}
+($\mathsf{spent}$, $\mathsf{retired}$, $\mathsf{exposed}$) initializes to
+0; $\mathsf{exposed}$ is set as soon as a spend \emph{request} on the
+handle reaches $\adv$, whether or not the session completes --- a spend
+request reveals the token's deterministic nullifier, so a candidate whose
+nullifier $\adv$ has already seen would be trivially distinguishable.}
 \label{fig:anon}
 \end{figure}
 
@@ -497,11 +506,13 @@ strategies remain in scope. All handle state
 The same-kind, same-mode, same-amount, equal-balance restrictions reflect
 leakage the syntax makes public by design. Retiring the \emph{candidates}
 closes the immediate distinguisher: replaying a candidate would reveal
-$\beta$ through nullifier reuse. Retiring the \emph{successor} (whose
-balance is the same in both worlds, given equal candidate balances) is
-not needed against that attack; it isolates the definition to a single
-challenged transcript rather than smuggling in a compositional guarantee
-about continued use. A chain definition (hidden, permuted token handles
+$\beta$ through nullifier reuse (and requiring unexposed candidates
+extends this to nullifiers revealed by \emph{aborted} pre-challenge
+sessions). Retiring the \emph{successor} isolates the definition to a
+single challenged transcript rather than smuggling in a compositional
+guarantee about continued use; for a deferred challenge the issuer's
+adaptive $t'$ choice can make the successor's balance itself
+$\beta$-dependent, so its retirement is also substantively necessary. A chain definition (hidden, permuted token handles
 with identical admissible continuations) is the natural strengthening and
 is left open. Section~\ref{sec:security} discusses the metadata any
 deployment leaks outside this game.
@@ -519,7 +530,7 @@ $\mathrm{Adv}^{\mathrm{omp}}_{\adv}(\lambda) :=
 function of $Q_S$ and $Q_H$).
 \end{assumption}
 
-\begin{figure}[!ht]
+\begin{figure}[H]
 \centering
 \begin{pcvstack}[boxed]
 \procedure{$\mathrm{Exp}^{\mathrm{omp}}_{\adv}(\lambda)$}{%
@@ -661,7 +672,7 @@ The construction proves membership in three NP relations. Define the
 helper maps (over the shared ideal XOF $\mathcal{H}$; $\mathsf{pack16}$
 packs an $\Fsixteen$-vector two nibbles per byte, first element in the
 low nibble):
-\begin{figure}[!ht]
+\begin{figure}[H]
 \centering
 \small
 \begin{pcvstack}[boxed]
@@ -748,7 +759,7 @@ interfaces. $\mathsf{digest}(\ctx, \mathit{req}) =
 \mathcal{H}(\text{``request-digest''} \,\|\, \ctx \,\|\,
 \mathsf{frame}(\mathit{req}))[0{:}256]$ is the exact-retry key.
 
-\begin{figure}[!ht]
+\begin{figure}[H]
 \centering
 \begin{pcvstack}[boxed]
 \procedure{$\mathsf{Setup}(1^\lambda, \mathsf{app})$}{%
@@ -786,7 +797,7 @@ interfaces. $\mathsf{digest}(\ctx, \mathit{req}) =
 \label{fig:issue-alg}
 \end{figure}
 
-\begin{figure}[!ht]
+\begin{figure}[H]
 \centering
 \begin{pcvstack}[boxed]
 \procedure{$\mathsf{Spend.Client}(\mathsf{pk}, \ctx, T, s, \mathsf{mode})$}{%
