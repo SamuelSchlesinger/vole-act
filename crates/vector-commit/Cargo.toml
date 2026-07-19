@@ -1,0 +1,15 @@
+[package]
+name = "vector-commit"
+description = "GGM-tree all-but-one vector commitments for VOLE-in-the-head"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sha3 = { workspace = true }
+
+[dev-dependencies]
+hex = { workspace = true }
+
+[lints]
+workspace = true

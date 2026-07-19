@@ -1,0 +1,15 @@
+[package]
+name = "binary-fields"
+description = "Binary field arithmetic for VOLE-in-the-head proofs and the MAYO trapdoor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rand_core = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true

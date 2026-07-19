@@ -1,0 +1,13 @@
+[package]
+name = "vole-act"
+description = "Post-quantum anonymous credit tokens from VOLE-in-the-head and MAYO"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+binary-fields = { workspace = true }
+vector-commit = { workspace = true }
+
+[lints]
+workspace = true

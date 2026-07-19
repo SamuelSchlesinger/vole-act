@@ -1,6 +1,34 @@
-[package]
-name = "vole-act"
+[workspace]
+resolver = "3"
+members = [
+    "crates/binary-fields",
+    "crates/vector-commit",
+    "crates/vole-act",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
+license = "MIT OR Apache-2.0"
 
-[dependencies]
+[workspace.dependencies]
+# Internal crates
+binary-fields = { path = "crates/binary-fields" }
+vector-commit = { path = "crates/vector-commit" }
+
+# External
+rand_core = "0.6.4"
+sha3 = "0.10"
+
+# Dev
+proptest = "1"
+hex = "0.4"
+
+[workspace.lints.rust]
+missing_docs = "warn"
+
+[profile.release]
+lto = "thin"
+
+[profile.bench]
+debug = true
