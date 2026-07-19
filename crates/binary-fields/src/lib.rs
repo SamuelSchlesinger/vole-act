@@ -25,6 +25,7 @@ mod gf2p128;
 pub use embed::embed_gf16;
 pub use gf2p128::GF2p128;
 pub use gf16::GF16;
+pub use gf16::packed as gf16_packed;
 
 use core::fmt::Debug;
 use core::ops::{Add, AddAssign, Mul, MulAssign, Sub, SubAssign};

@@ -30,12 +30,8 @@ fn main() {
         _ => PerformanceProfile::Balanced,
     };
     let mut rng = StdRng::seed_from_u64(0xF0F0);
-    let mut issuer = Issuer::generate_with_store(
-        b"vole-act/profile",
-        profile,
-        NonPersistingStore,
-        &mut rng,
-    );
+    let mut issuer =
+        Issuer::generate_with_store(b"vole-act/profile", profile, NonPersistingStore, &mut rng);
     let public = issuer.public_key().clone();
     let (pending, request) = public.prepare_issue(100, &mut rng).unwrap();
     let response = issuer.issue(&request, 100, &mut rng).unwrap();

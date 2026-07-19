@@ -1,9 +1,23 @@
 //! Dense row-major matrices over GF(16) — just enough linear algebra for
 //! MAYO (products, transposes, `Upper`, Gaussian elimination).
+//!
+//! The product kernels (`mul`, `mul_vec`, `vec_mul`, `quad_form`) run on
+//! eight-lane packed words ([`binary_fields::gf16_packed`]): branch-free,
+//! no secret-indexed lookups, bit-identical to the definitional scalar
+//! loops (which remain in the test module as oracles).
 
-use binary_fields::{BinaryField, GF16};
+use binary_fields::{BinaryField, GF16, gf16_packed as packed};
 use rand_core::CryptoRngCore;
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
+
+/// Read one packed 8-lane word from canonical GF(16) bytes, zero-padded.
+#[inline]
+fn word_at(bytes: &[u8], start: usize) -> u64 {
+    let end = (start + 8).min(bytes.len());
+    let mut buf = [0u8; 8];
+    buf[..end - start].copy_from_slice(&bytes[start..end]);
+    u64::from_le_bytes(buf)
+}
 
 /// A dense row-major matrix over `GF(16)`.
 #[derive(Clone, PartialEq, Eq)]
@@ -80,12 +94,22 @@ impl Mat {
     pub fn mul(&self, rhs: &Mat) -> Mat {
         assert_eq!(self.cols, rhs.rows);
         let mut out = Mat::zero(self.rows, rhs.cols);
+        let rhs_bytes = GF16::slice_as_bytes(&rhs.data);
+        let words = rhs.cols.div_ceil(8);
+        // Row accumulator in packed lanes; holds key-derived secrets during
+        // key expansion, so it is wiped on drop.
+        let mut acc = Zeroizing::new(vec![0u64; words.max(1)]);
         for r in 0..self.rows {
+            acc.fill(0);
             for i in 0..self.cols {
                 let a = self[(r, i)];
-                for c in 0..rhs.cols {
-                    out[(r, c)] += a * rhs[(i, c)];
+                let row_base = i * rhs.cols;
+                for (w, slot) in acc.iter_mut().enumerate() {
+                    *slot ^= packed::mul_scalar8(word_at(rhs_bytes, row_base + 8 * w), a);
                 }
+            }
+            for c in 0..rhs.cols {
+                out[(r, c)] = GF16::new((acc[c / 8] >> (8 * (c % 8))) as u8);
             }
         }
         out
@@ -130,14 +154,25 @@ impl Mat {
     }
 
     /// `vᵀ·M`: row-vector times matrix, as a vector of length `cols`.
+    ///
+    /// Packed row-axpy: each row is scaled by its (possibly secret) scalar
+    /// eight lanes at a time. Lanes beyond `cols` in the final word never
+    /// reach the unpacked output.
     #[must_use]
     pub fn vec_mul(&self, v: &[GF16]) -> Vec<GF16> {
         assert_eq!(v.len(), self.rows);
-        let mut out = vec![GF16::ZERO; self.cols];
+        let bytes = GF16::slice_as_bytes(&self.data);
+        let words = self.cols.div_ceil(8);
+        let mut acc = Zeroizing::new(vec![0u64; words.max(1)]);
         for (r, &vr) in v.iter().enumerate() {
-            for c in 0..self.cols {
-                out[c] += vr * self[(r, c)];
+            let row_base = r * self.cols;
+            for (w, slot) in acc.iter_mut().enumerate() {
+                *slot ^= packed::mul_scalar8(word_at(bytes, row_base + 8 * w), vr);
             }
+        }
+        let mut out = vec![GF16::ZERO; self.cols];
+        for (c, elem) in out.iter_mut().enumerate() {
+            *elem = GF16::new((acc[c / 8] >> (8 * (c % 8))) as u8);
         }
         out
     }
@@ -154,16 +189,33 @@ impl Mat {
     }
 
     /// `M·v`: matrix times column vector, as a vector of length `rows`.
+    ///
+    /// Packed dot products: eight lane-wise nibble multiplies per word,
+    /// XOR-folded to the row sum. `word_at` zero-pads past the end of the
+    /// data, and zero lanes contribute zero to the fold, so ragged widths
+    /// need no special casing beyond padding `v`.
     #[must_use]
     pub fn mul_vec(&self, v: &[GF16]) -> Vec<GF16> {
         assert_eq!(v.len(), self.cols);
+        let bytes = GF16::slice_as_bytes(&self.data);
+        let v_bytes = GF16::slice_as_bytes(v);
+        let words = self.cols.div_ceil(8);
         let mut out = vec![GF16::ZERO; self.rows];
-        for r in 0..self.rows {
-            let mut acc = GF16::ZERO;
-            for c in 0..self.cols {
-                acc += self[(r, c)] * v[c];
+        for (r, elem) in out.iter_mut().enumerate() {
+            let row_base = r * self.cols;
+            let mut acc = 0u64;
+            for w in 0..words {
+                // The row word may run into the next row's bytes on ragged
+                // widths; mask to the true row length so those lanes are
+                // zero before the fold.
+                let mut row_word = word_at(bytes, row_base + 8 * w);
+                let remaining = self.cols - 8 * w;
+                if remaining < 8 {
+                    row_word &= (1u64 << (8 * remaining)) - 1;
+                }
+                acc ^= packed::mul_lanes8(row_word, word_at(v_bytes, 8 * w));
             }
-            out[r] = acc;
+            *elem = packed::fold8(acc);
         }
         out
     }
@@ -330,6 +382,74 @@ mod tests {
     use super::*;
     use rand::SeedableRng;
     use rand::rngs::StdRng;
+
+    /// Definitional scalar implementations, kept as oracles for the packed
+    /// kernels.
+    fn mul_reference(a: &Mat, rhs: &Mat) -> Mat {
+        let mut out = Mat::zero(a.rows, rhs.cols);
+        for r in 0..a.rows {
+            for i in 0..a.cols {
+                let s = a[(r, i)];
+                for c in 0..rhs.cols {
+                    out[(r, c)] += s * rhs[(i, c)];
+                }
+            }
+        }
+        out
+    }
+
+    fn mul_vec_reference(m: &Mat, v: &[GF16]) -> Vec<GF16> {
+        let mut out = vec![GF16::ZERO; m.rows];
+        for (r, elem) in out.iter_mut().enumerate() {
+            for c in 0..m.cols {
+                *elem += m[(r, c)] * v[c];
+            }
+        }
+        out
+    }
+
+    fn vec_mul_reference(m: &Mat, v: &[GF16]) -> Vec<GF16> {
+        let mut out = vec![GF16::ZERO; m.cols];
+        for (r, &vr) in v.iter().enumerate() {
+            for (c, elem) in out.iter_mut().enumerate() {
+                *elem += vr * m[(r, c)];
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn packed_kernels_match_reference() {
+        let mut rng = StdRng::seed_from_u64(0x9A17);
+        // Ragged and word-aligned shapes, including MAYO2's own (64, 81, 17).
+        for (rows, mid, cols) in [
+            (1, 1, 1),
+            (3, 5, 7),
+            (8, 8, 8),
+            (9, 16, 17),
+            (17, 64, 17),
+            (64, 81, 17),
+            (64, 64, 64),
+        ] {
+            let a = Mat::random(rows, mid, &mut rng);
+            let b = Mat::random(mid, cols, &mut rng);
+            assert_eq!(a.mul(&b), mul_reference(&a, &b), "{rows}x{mid}x{cols}");
+
+            let v_mid: Vec<GF16> = (0..mid).map(|_| GF16::random(&mut rng)).collect();
+            assert_eq!(
+                a.mul_vec(&v_mid),
+                mul_vec_reference(&a, &v_mid),
+                "mul_vec {rows}x{mid}"
+            );
+
+            let v_rows: Vec<GF16> = (0..rows).map(|_| GF16::random(&mut rng)).collect();
+            assert_eq!(
+                a.vec_mul(&v_rows),
+                vec_mul_reference(&a, &v_rows),
+                "vec_mul {rows}x{mid}"
+            );
+        }
+    }
 
     #[test]
     fn upper_symmetrizes() {

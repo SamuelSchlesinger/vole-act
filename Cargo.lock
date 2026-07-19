@@ -862,6 +862,7 @@ dependencies = [
  "binary-fields",
  "rand 0.8.7",
  "rand_core 0.6.4",
+ "rayon",
  "sha3",
  "vector-commit",
  "zeroize",

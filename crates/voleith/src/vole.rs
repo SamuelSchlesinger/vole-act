@@ -18,10 +18,11 @@
 
 use crate::bits::BitVec;
 use binary_fields::{BinaryField, GF2p128};
+use rayon::prelude::*;
 use sha3::Shake256;
 use sha3::digest::{ExtendableOutput, Update, XofReader};
 use vector_commit::{AllButOneVc, SALT_LEN, Salt, Seed, VcCommitment, VcError, VcOpening};
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroize;
 
 /// VOLE-in-the-head parameters. `λ = tau · k` must equal 128.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,6 +96,68 @@ fn expand_leaf(salt: &[u8; SALT_LEN], j: usize, i: usize, seed: &Seed, l_hat: us
     h.update(seed);
     let mut reader = h.finalize_xof();
     BitVec::from_xof(&mut reader, l_hat)
+}
+
+/// Streaming accumulator turning the leaf expansions `r_0 … r_{2^k−1}` into
+/// `u = Σᵢ rᵢ` and `planes[b] = Σ_{i: bit_b(i)=1} rᵢ` using pairwise subtree
+/// sums (a binary-counter walk): ~2 vector XORs per leaf instead of the
+/// definitional `1 + k/2`. This is an exact XOR reassociation — every leaf
+/// contributes to exactly the same outputs — with `O(k)` working vectors.
+///
+/// `pending[l]` holds the sum of a completed even-position subtree at level
+/// `l`, awaiting its odd sibling; when the sibling's sum arrives it is (a)
+/// XORed into `planes[l]` (odd position at level `l` ⟺ bit `l` of the leaf
+/// index is set for every leaf in that subtree) and (b) merged upward.
+/// All state is wiped on drop, covering panic paths on the prover side.
+struct PlaneAccumulator {
+    k: usize,
+    planes: Vec<BitVec>,
+    pending: Vec<Option<BitVec>>,
+    count: usize,
+}
+
+impl PlaneAccumulator {
+    fn new(k: usize, l_hat: usize) -> Self {
+        PlaneAccumulator {
+            k,
+            planes: vec![BitVec::zero(l_hat); k],
+            pending: (0..=k).map(|_| None).collect(),
+            count: 0,
+        }
+    }
+
+    /// Feed the next leaf expansion, in index order.
+    fn push(&mut self, r: BitVec) {
+        let mut cur = r;
+        let mut level = 0;
+        while let Some(left) = self.pending[level].take() {
+            // `cur` is the completed odd-position subtree sum at `level`.
+            self.planes[level].xor_assign(&cur);
+            cur.xor_assign(&left);
+            level += 1;
+        }
+        self.pending[level] = Some(cur);
+        self.count += 1;
+    }
+
+    /// After exactly `2^k` pushes: `(u, planes)`.
+    fn finish(mut self) -> (BitVec, Vec<BitVec>) {
+        assert_eq!(self.count, 1usize << self.k, "accumulator not full");
+        let u = self.pending[self.k]
+            .take()
+            .expect("2^k pushes fill the top level");
+        (u, core::mem::take(&mut self.planes))
+    }
+}
+
+impl Drop for PlaneAccumulator {
+    fn drop(&mut self) {
+        // Partial sums are as secret as the VOLE itself (prover side).
+        self.planes.zeroize();
+        for slot in self.pending.iter_mut().flatten() {
+            slot.zeroize();
+        }
+    }
 }
 
 /// Assemble per-coordinate `F₂^λ` elements from τ·k bit planes.
@@ -177,24 +240,28 @@ impl ProverVole {
             return Err(VcError::InvalidParameters);
         }
 
+        // The τ trees are independent; expand them in parallel and collect
+        // in index order, so the assembled outputs (and hence the transcript)
+        // are identical to the sequential walk.
+        let per_tree: Result<Vec<_>, VcError> = (0..params.tau)
+            .into_par_iter()
+            .map(|j| {
+                let (vc, com) =
+                    AllButOneVc::commit(root_seeds[j], tree_salt(salt, j), params.k as u32)?;
+                let mut acc = PlaneAccumulator::new(params.k, l_hat);
+                for (i, leaf) in vc.leaves().iter().enumerate() {
+                    acc.push(expand_leaf(salt, j, i, leaf, l_hat));
+                }
+                let (u_j, planes_j) = acc.finish();
+                Ok((vc, com, u_j, planes_j))
+            })
+            .collect();
+
         let mut trees = Vec::with_capacity(params.tau);
         let mut coms = Vec::with_capacity(params.tau);
         let mut us: Vec<BitVec> = Vec::with_capacity(params.tau);
         let mut planes: Vec<Vec<BitVec>> = Vec::with_capacity(params.tau);
-
-        for (j, root) in root_seeds.iter().enumerate() {
-            let (vc, com) = AllButOneVc::commit(*root, tree_salt(salt, j), params.k as u32)?;
-            let mut u_j = BitVec::zero(l_hat);
-            let mut planes_j = vec![BitVec::zero(l_hat); params.k];
-            for (i, leaf) in vc.leaves().iter().enumerate() {
-                let r_i = Zeroizing::new(expand_leaf(salt, j, i, leaf, l_hat));
-                u_j.xor_assign(&r_i);
-                for (b, plane) in planes_j.iter_mut().enumerate() {
-                    if (i >> b) & 1 == 1 {
-                        plane.xor_assign(&r_i);
-                    }
-                }
-            }
+        for (vc, com, u_j, planes_j) in per_tree? {
             trees.push(vc);
             coms.push(com);
             us.push(u_j);
@@ -264,40 +331,51 @@ pub fn reconstruct_keys(
         return Err(VcError::InvalidOpening);
     }
 
-    let mut planes: Vec<Vec<BitVec>> = Vec::with_capacity(params.tau);
-    for j in 0..params.tau {
-        let delta = deltas[j];
-        let leaves = AllButOneVc::verify(
-            &coms[j],
-            tree_salt(salt, j),
-            params.k as u32,
-            delta,
-            &openings[j],
-        )?;
-        let mut planes_j = vec![BitVec::zero(l_hat); params.k];
-        for (i, leaf) in leaves.iter().enumerate() {
-            let Some(seed) = leaf else { continue };
-            let r_i = expand_leaf(salt, j, i, seed, l_hat);
-            let e = i ^ delta;
-            for (b, plane) in planes_j.iter_mut().enumerate() {
-                if (e >> b) & 1 == 1 {
-                    plane.xor_assign(&r_i);
+    // The τ trees reconstruct independently; parallel with in-order collect,
+    // identical outputs to the sequential walk. The accumulator walks leaves
+    // in `e = i ⊕ Δ` order (the hole i = Δ becomes the zero vector at e = 0),
+    // which computes exactly `planes[b] = Σ_{bit_b(e)=1} r_{e⊕Δ}` — the same
+    // sums as the definitional per-leaf loop; the SHAKE leaf expansions are
+    // position-keyed and order-independent.
+    let n = params.leaves();
+    let planes: Result<Vec<Vec<BitVec>>, VcError> = (0..params.tau)
+        .into_par_iter()
+        .map(|j| {
+            let delta = deltas[j];
+            let leaves = AllButOneVc::verify(
+                &coms[j],
+                tree_salt(salt, j),
+                params.k as u32,
+                delta,
+                &openings[j],
+            )?;
+            let mut acc = PlaneAccumulator::new(params.k, l_hat);
+            for e in 0..n {
+                if e == 0 {
+                    acc.push(BitVec::zero(l_hat));
+                } else {
+                    let i = e ^ delta;
+                    let seed = leaves[i]
+                        .as_ref()
+                        .expect("verify() hides exactly the challenged leaf");
+                    acc.push(expand_leaf(salt, j, i, seed, l_hat));
                 }
             }
-        }
-        // Apply the u-correction: q'ₜ = qₜ + Δⱼ·c⁽ʲ⁾ₜ, i.e. XOR the
-        // correction bits into every plane where Δⱼ has a set bit.
-        if j > 0 {
-            let c = &corrections[j - 1];
-            for (b, plane) in planes_j.iter_mut().enumerate() {
-                if (delta >> b) & 1 == 1 {
-                    plane.xor_assign(c);
+            let (_, mut planes_j) = acc.finish();
+            // Apply the u-correction: q'ₜ = qₜ + Δⱼ·c⁽ʲ⁾ₜ, i.e. XOR the
+            // correction bits into every plane where Δⱼ has a set bit.
+            if j > 0 {
+                let c = &corrections[j - 1];
+                for (b, plane) in planes_j.iter_mut().enumerate() {
+                    if (delta >> b) & 1 == 1 {
+                        plane.xor_assign(c);
+                    }
                 }
             }
-        }
-        planes.push(planes_j);
-    }
-    Ok(assemble(&planes, params, l_hat))
+            Ok(planes_j)
+        })
+        .collect();
+    Ok(assemble(&planes?, params, l_hat))
 }
 
 /// Interpret a λ-bit challenge as the field element `Δ` and its τ chunk
@@ -343,6 +421,52 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn plane_accumulator_matches_definitional_loop() {
+        // The binary-counter accumulator must equal the per-leaf loop
+        // `u ^= r_i; planes[b] ^= r_i when bit_b(i)` for every k and for
+        // ragged vector lengths.
+        for k in 1..=8usize {
+            let l_hat = 213;
+            let n = 1usize << k;
+            let mut state = 0x5EED_0000_0000_0000u64 | k as u64;
+            let mut next = || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state
+            };
+            let leaves: Vec<BitVec> = (0..n)
+                .map(|_| {
+                    let mut v = BitVec::zero(l_hat);
+                    for t in 0..l_hat {
+                        v.set(t, next() & 1 == 1);
+                    }
+                    v
+                })
+                .collect();
+
+            let mut u_ref = BitVec::zero(l_hat);
+            let mut planes_ref = vec![BitVec::zero(l_hat); k];
+            for (i, r) in leaves.iter().enumerate() {
+                u_ref.xor_assign(r);
+                for (b, plane) in planes_ref.iter_mut().enumerate() {
+                    if (i >> b) & 1 == 1 {
+                        plane.xor_assign(r);
+                    }
+                }
+            }
+
+            let mut acc = PlaneAccumulator::new(k, l_hat);
+            for r in leaves {
+                acc.push(r);
+            }
+            let (u, planes) = acc.finish();
+            assert_eq!(u, u_ref, "u mismatch at k={k}");
+            assert_eq!(planes, planes_ref, "planes mismatch at k={k}");
+        }
     }
 
     #[test]
