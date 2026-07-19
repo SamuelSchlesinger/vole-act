@@ -8,6 +8,13 @@ license.workspace = true
 [dependencies]
 binary-fields = { workspace = true }
 vector-commit = { workspace = true }
+voleith = { workspace = true }
+mayo = { workspace = true }
+rand_core = { workspace = true }
+sha3 = { workspace = true }
+
+[dev-dependencies]
+rand = "0.8"
 
 [lints]
 workspace = true

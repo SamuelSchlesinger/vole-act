@@ -24,7 +24,7 @@ pub mod proof;
 pub mod transcript;
 pub mod vole;
 
-pub use backend::{Backend, Circuit, CountingBackend, ProverBackend, VerifierBackend};
+pub use backend::{Backend, Circuit, CountingBackend, ProverBackend, QuadTerm, VerifierBackend};
 pub use proof::{Proof, prove, verify};
 pub use vole::{PARAMS_128, Params};
 

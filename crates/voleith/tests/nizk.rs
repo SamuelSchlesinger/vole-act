@@ -280,3 +280,92 @@ fn tampered_proofs_rejected() {
     // Untampered still verifies (sanity).
     verify(&PARAMS_128, b"quadratic", &circuit, &proof).unwrap();
 }
+
+/// Prove knowledge of x, y ∈ GF(16) satisfying the two-equation system
+/// { x·y = p, x² + y = q } via a folded quadratic system (shared terms).
+struct SystemCircuit {
+    p: GF16,
+    q: GF16,
+}
+
+impl Circuit for SystemCircuit {
+    fn build<B: Backend>(&self, backend: &mut B) -> Result<(), VoleithError> {
+        use voleith::QuadTerm;
+        let mut xy_bits = Vec::with_capacity(8);
+        for _ in 0..8 {
+            xy_bits.push(backend.witness_bit()?);
+        }
+        for bit in &xy_bits {
+            backend.assert_mul(bit, bit, bit);
+        }
+        let x = lift_gf16(
+            backend,
+            &[
+                xy_bits[0].clone(),
+                xy_bits[1].clone(),
+                xy_bits[2].clone(),
+                xy_bits[3].clone(),
+            ],
+        );
+        let y = lift_gf16(
+            backend,
+            &[
+                xy_bits[4].clone(),
+                xy_bits[5].clone(),
+                xy_bits[6].clone(),
+                xy_bits[7].clone(),
+            ],
+        );
+        // Equation 0: x·y + p = 0. Equation 1: x·x + y + q = 0.
+        let lin0 = backend.constant(embed_gf16(self.p));
+        let yq = backend.constant(embed_gf16(self.q));
+        let lin1 = backend.add(&y, &yq);
+        backend.assert_quad_system(
+            vec![
+                QuadTerm {
+                    a: x.clone(),
+                    b: y,
+                    coeffs: vec![GF16::ONE, GF16::ZERO],
+                },
+                QuadTerm {
+                    a: x.clone(),
+                    b: x,
+                    coeffs: vec![GF16::ZERO, GF16::ONE],
+                },
+            ],
+            vec![lin0, lin1],
+        );
+        Ok(())
+    }
+}
+
+#[test]
+fn quad_system_completeness_and_soundness() {
+    let mut rng = StdRng::seed_from_u64(7);
+    for xv in [1u8, 5, 11] {
+        for yv in [2u8, 7, 14] {
+            let x = GF16::new(xv);
+            let y = GF16::new(yv);
+            let circuit = SystemCircuit {
+                p: x * y,
+                q: x.square() + y,
+            };
+            let mut witness = gf16_bits(x);
+            witness.extend(gf16_bits(y));
+            let proof = prove(&PARAMS_128, b"system", &circuit, &witness, &mut rng).unwrap();
+            verify(&PARAMS_128, b"system", &circuit, &proof).unwrap();
+
+            // A witness satisfying eq 0 but not eq 1 must be caught by the fold.
+            let bad = SystemCircuit {
+                p: x * y,
+                q: x.square() + y + GF16::ONE,
+            };
+            assert_eq!(
+                prove(&PARAMS_128, b"system", &bad, &witness, &mut rng).unwrap_err(),
+                VoleithError::Unsatisfiable
+            );
+            // Cross-verification with mismatched public parameters fails.
+            assert!(verify(&PARAMS_128, b"system", &bad, &proof).is_err());
+        }
+    }
+}

@@ -50,5 +50,8 @@ opt-level = 3
 [profile.dev.package.mayo]
 opt-level = 3
 
+[profile.dev.package.vole-act]
+opt-level = 3
+
 [profile.bench]
 debug = true

@@ -28,7 +28,9 @@
 //!    forces every circuit constraint.
 
 use crate::VoleithError;
-use crate::backend::{Circuit, CountingBackend, ProverBackend, VerifierBackend};
+use crate::backend::{
+    Circuit, CountingBackend, ProverBackend, ProverConstraint, VerifierBackend, VerifierConstraint,
+};
 use crate::bits::BitVec;
 use crate::transcript::Transcript;
 use crate::vole::{Params, ProverVole, reconstruct_keys, split_delta};
@@ -231,15 +233,29 @@ pub fn prove<C: Circuit>(
     consist.extend_from_slice(&v_tilde.to_bytes());
     tr.absorb(b"consistency", &consist);
 
-    // QuickSilver batch.
+    // QuickSilver batch. Quadratic systems draw their fold coefficients
+    // from the same challenge stream, in emission order, before their χ.
     let mut chi = tr.challenge_xof(b"chi");
     let (qs_mask_u, qs_mask_v) = qs_mask_combine(l, lambda, Some(&vole.u), &vole.tags);
     let mut qs_w = qs_mask_v;
     let mut qs_u = qs_mask_u;
-    for (a0, a1) in &backend.constraints {
+    for constraint in &backend.constraints {
+        let (a0, a1) = match constraint {
+            ProverConstraint::Simple(a0, a1) => (*a0, *a1),
+            ProverConstraint::System(sys) => {
+                let phis: Vec<GF2p128> = (0..sys.num_equations())
+                    .map(|_| next_elem(&mut chi))
+                    .collect();
+                let (a0, a1, sat) = sys.fold(&phis);
+                if !sat {
+                    return Err(VoleithError::Unsatisfiable);
+                }
+                (a0, a1)
+            }
+        };
         let x = next_elem(&mut chi);
-        qs_w += x * *a0;
-        qs_u += x * *a1;
+        qs_w += x * a0;
+        qs_u += x * a1;
     }
     let mut qs_bytes = Vec::with_capacity(32);
     qs_bytes.extend_from_slice(&qs_u.to_bytes());
@@ -355,9 +371,18 @@ pub fn verify<C: Circuit>(
     // QuickSilver check: Σ χᵢ·Bᵢ + Q* == W + U·Δ.
     let (_, qs_mask_key) = qs_mask_combine(l, lambda, None, &keys);
     let mut acc = qs_mask_key;
-    for b in &backend.checks {
+    for check in &backend.checks {
+        let b = match check {
+            VerifierConstraint::Simple(b) => *b,
+            VerifierConstraint::System(sys) => {
+                let phis: Vec<GF2p128> = (0..sys.num_equations())
+                    .map(|_| next_elem(&mut chi))
+                    .collect();
+                sys.fold(&phis, delta)
+            }
+        };
         let x = next_elem(&mut chi);
-        acc += x * *b;
+        acc += x * b;
     }
     if acc != proof.qs_w + proof.qs_u * delta {
         return Err(VoleithError::InvalidProof);

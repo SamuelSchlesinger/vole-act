@@ -432,7 +432,12 @@ name = "vole-act"
 version = "0.1.0"
 dependencies = [
  "binary-fields",
+ "mayo",
+ "rand 0.8.7",
+ "rand_core 0.6.4",
+ "sha3",
  "vector-commit",
+ "voleith",
 ]
 
 [[package]]

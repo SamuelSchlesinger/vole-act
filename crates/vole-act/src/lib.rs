@@ -11,3 +11,5 @@
 //!
 //! The scheme layers (bottom-up): `binary-fields` → `vector-commit` →
 //! `voleith` → `mayo` → this crate.
+
+pub mod keccak;
