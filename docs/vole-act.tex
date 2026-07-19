@@ -654,98 +654,210 @@ return were known in advance, the client would simply spend less. All four
 transitions carry distinct domain-separation tags end-to-end, so mode
 confusion at the byte level cannot create an untyped path.
 
-\subsection{Algorithms}
-\label{sec:algorithms}
-
-Figure~\ref{fig:algorithms} instantiates Definition~\ref{def:syntax}.
-$\mathsf{pack16}$ packs a $\Fsixteen$-vector two nibbles per byte, first
-element in the low nibble; all domain tags are ASCII strings under
-prefix-free framing; $\Pi.\mathsf{Prove}/\mathsf{Verify}$ is the VOLEitH
-argument of Section~\ref{sec:circuit} for the stated relation, with the
-statement (all public values, tags, and $\ctx$) bound into Fiat--Shamir.
-
-\begin{figure}[t]
-\small
-\begin{itemize}
-  \item $\mathsf{Setup}(1^\lambda, \mathsf{app})$: run MAYO trapdoor
-  generation for the chosen parameter set; expand the whipped forms; let
-  $h_{\mathsf{pk}}$ be the domain-separated $\shake$ hash of the canonical
-  row-major encoding of the expanded whipped forms of $P^\ast$; set
-  \begin{align*}
-  \ctx \gets \shake(&\text{``context''} \,\|\, \mathsf{frame}(\mathsf{app})
-  \,\|\, h_{\mathsf{pk}}\\
-  &\|\, \text{parameter and profile identifiers}
-  \,\|\, \text{balance width})[0{:}256].
-  \end{align*}
-  Output $(\mathsf{sk}, \mathsf{pk}, \ctx)$.
-  \item $\mathsf{Issue}$, client with $(\mathsf{pk}, b)$: sample
-  $\kappa, \rho \gets \{0,1\}^{256}$; compute $\Cred$ from the credential
-  stream; send $(b, \Cred, \pi)$ where $\pi \gets \Pi.\mathsf{Prove}$ for
-  the relation $\Cred = \Cred(\kappa,b,\rho)$ with public $(b, \Cred,
-  \ctx)$. Issuer: verify $\pi$ (and external authorization); return
-  $\sigma \gets \Spre(\mathsf{sk}, \Cred)$. Client: accept the direct
-  token $T = (\sigma, \kappa, b, \rho)$ iff $P^\ast(\sigma) = \Cred$.
-  \item $\mathsf{Spend}$, client with $(\mathsf{pk}, T, s)$: sample fresh
-  $(\kappa', \rho')$, set $b' = \mathsf{bal}(T) - s$, compute $\Cred'$ and
-  $\Null$ from $T$'s stream; send $(s, \Null, \Cred', \pi)$ for the spend
-  relation of Section~\ref{sec:relation} (typed for $T$'s kind, settlement
-  tag ``spend''). Issuer: if the store already holds a record for $\Null$
-  with the same request digest, return the stored response; on a digest
-  conflict, reject. Otherwise verify $\pi$, sample
-  $\sigma' \gets \Spre(\mathsf{sk}, \Cred')$, construct the candidate
-  record $(\Null, \text{request digest}, \sigma')$, and \emph{atomically}
-  insert it. If another record won the insertion race, compare digests:
-  replay the winner if its digest matches this request, otherwise reject.
-  Client:
-  accept the direct token $(\sigma', \kappa', b', \rho')$ iff
-  $P^\ast(\sigma') = \Cred'$.
-  \item $\mathsf{SpendDeferred}$: as $\mathsf{Spend}$ with settlement tag
-  ``deferred-return-spend'', except the issuer, after verifying $\pi$,
-  first picks $t' \le s$, then samples
-  $\sigma' \gets \Spre(\mathsf{sk}, \Def(\ctx, \Cred', t'))$, constructs
-  the candidate record containing $(t', \sigma')$, and atomically inserts
-  it; if another record won the race, it replays the winner --- including
-  the winner's original $t'$ --- when digests match and rejects otherwise.
-  Client: accept the deferred-return token
-  $(\sigma', \kappa', b', \rho', t')$ iff $t' \le s$ and
-  $P^\ast(\sigma') = \Def(\ctx, \Cred', t')$.
-  \item $\mathsf{VerifyToken}(\mathsf{pk}, T)$: check that $T$'s stored
-  context equals the context derived from $\mathsf{pk}$; that its
-  credential kind and top-up obey the format's convention (a direct token
-  carries no top-up); that the effective balance does not overflow;
-  recompute $T$'s target ($\Cred$ or $\Def$) from its opening; and check
-  $P^\ast(\sigma) = \text{target}$. (The anonymity game relies on honest
-  clients performing \emph{all} of these checks.)
-\end{itemize}
-\caption{The VOLE-ACT algorithms. Every request and response carries the
-credential-kind and settlement-mode tags; request digests bind the full
-typed request bytes under $\ctx$.}
-\label{fig:algorithms}
-\end{figure}
-
-\subsection{The spend relation}
+\subsection{Proof relations}
 \label{sec:relation}
 
-To spend public amount $s$ from a direct token, the client reveals
-$(s, \Null, \Cred')$ and proves knowledge of
-$(\sigma, \kappa, b, \rho, \kappa', b', \rho')$ such that
-\[
-P^\ast(\sigma) = \Cred(\kappa,b,\rho), \qquad
-\Null = \Null(\kappa,b,\rho), \qquad
-b' + s = b, \qquad
-\Cred' = \Cred(\kappa',b',\rho').
-\]
-For a deferred-input spend the first equation becomes
-$P^\ast(\sigma) = \Def(\ctx, \Cred(\kappa,b,\rho), t)$ with hidden $t$, together with
-the exact fold $b + t = e$ and $b' + s = e$. The balance equations are
-\emph{exact 64-bit unsigned additions with zero final carry}, proven over
-committed carry bits --- there is no modular wraparound to exploit, and
-overspending is exactly the statement ``the final carry is 1,'' which the
-circuit rejects. The issuer verifies, signs the fresh digest
-($\sigma' \gets \Spre(\mathsf{sk}, \Cred')$, or the nested target for a
-deferred settlement), and atomically stores the request digest and response
-under $\Null$; exact retransmissions replay the stored response, so a
-network failure cannot burn a balance.
+The construction proves membership in three NP relations. Define the
+helper maps (over the shared ideal XOF $\mathcal{H}$; $\mathsf{pack16}$
+packs an $\Fsixteen$-vector two nibbles per byte, first element in the
+low nibble):
+\begin{figure}[!ht]
+\centering
+\small
+\begin{pcvstack}[boxed]
+\begin{pchstack}
+\procedure{$\mathsf{CredStream}_{\ctx}(\kappa, b, \rho)$}{%
+ X \gets \mathcal{H}(\text{``credential''} \,\|\, \ctx \,\|\, \kappa
+   \,\|\, \enc(b) \,\|\, \rho) \\
+ \Cred \gets X[0{:}4m] \text{ as } \Fsixteen^{m}; \quad
+   \Null \gets X[4m{:}4m{+}256] \\
+ \pcreturn (\Cred, \Null)}
+\pchspace
+\procedure{$\mathsf{DefTarget}_{\ctx}(\Cred, t)$}{%
+ \pcreturn \mathcal{H}(\text{``deferred''} \,\|\, \ctx \,\|\,
+   \mathsf{pack16}(\Cred) \,\|\, \enc(t))[0{:}4m]}
+\end{pchstack}
+\pcvspace
+\begin{pchstack}
+\procedure{$\mathsf{Target}(T)$}{%
+ (\Cred, \_) \gets \mathsf{CredStream}_{\ctx_T}(\kappa_T, b_T, \rho_T) \\
+ \pcif \mathsf{kind}(T) = \mathsf{Direct}: \pcreturn \Cred \\
+ \pcreturn \mathsf{DefTarget}_{\ctx_T}(\Cred, t_T)}
+\pchspace
+\procedure{$\mathsf{VerifyToken}(\mathsf{pk}, T)$}{%
+ \pcif \ctx_T \ne \mathsf{DeriveCtx}(\mathsf{pk}): \pcreturn 0 \\
+ \pcif \mathsf{kind}(T) = \mathsf{Direct} \wedge t_T \ne 0: \pcreturn 0 \\
+ \pcif b_T + t_T \ge 2^{64}: \pcreturn 0 \\
+ \pcreturn [P^\ast(\sigma_T) = \mathsf{Target}(T)]}
+\end{pchstack}
+\end{pcvstack}
+\caption{Helper maps and local token authentication. A token carries the
+tuple $(\mathsf{kind}, \sigma, \kappa, b, \rho, t)$, with $t = 0$ for the
+direct format, together with its stored context $\ctx_T$; the effective
+balance is $\mathsf{bal}(T) = b_T + t_T$.}
+\label{fig:helpers}
+\end{figure}
+
+The issuance relation states that a revealed digest opens to the public
+balance; the two spend relations state possession of a preimage for the
+input token's target, correct nullifier derivation, exact balance
+conservation, and well-formedness of the fresh commitment:
+\begin{align*}
+\mathcal{R}_{\mathsf{issue}} = \bigl\{\,
+ &(\ctx, b, \Cred);\; (\kappa, \rho) \;:\;
+ (\Cred, \cdot) = \mathsf{CredStream}_{\ctx}(\kappa, b, \rho)
+ \,\bigr\} \\[0.4em]
+\mathcal{R}_{\mathsf{spend}}^{\mathsf{Dir}} = \bigl\{\,
+ &(\ctx, s, \Null, \Cred');\;
+   (\sigma, \kappa, b, \rho, \kappa', b', \rho') \;: \\
+ &(\Cred, \Null) = \mathsf{CredStream}_{\ctx}(\kappa, b, \rho)
+ \;\wedge\; P^\ast(\sigma) = \Cred \\
+ &\wedge\; b' + s = b \text{ exactly (no 64-bit wrap)}
+ \;\wedge\; (\Cred', \cdot) =
+   \mathsf{CredStream}_{\ctx}(\kappa', b', \rho')
+ \,\bigr\} \\[0.4em]
+\mathcal{R}_{\mathsf{spend}}^{\mathsf{Def}} = \bigl\{\,
+ &(\ctx, s, \Null, \Cred');\;
+   (\sigma, \kappa, b, \rho, t, \kappa', b', \rho') \;: \\
+ &(\Cred, \Null) = \mathsf{CredStream}_{\ctx}(\kappa, b, \rho)
+ \;\wedge\; P^\ast(\sigma) = \mathsf{DefTarget}_{\ctx}(\Cred, t) \\
+ &\wedge\; b + t = b' + s \text{ exactly (both sums below } 2^{64})
+ \;\wedge\; (\Cred', \cdot) =
+   \mathsf{CredStream}_{\ctx}(\kappa', b', \rho')
+ \,\bigr\}
+\end{align*}
+The balance equations are exact 64-bit unsigned additions with zero final
+carry, proven over committed carry bits: there is no modular wraparound to
+exploit, and overspending is exactly the statement ``the final carry is
+1,'' which the relation excludes. All witness scalars range over their
+stated domains ($\kappa, \rho \in \{0,1\}^{256}$;
+$b, b', t \in \{0, \dots, 2^{64}{-}1\}$).
+
+\subsection{Protocol algorithms}
+\label{sec:algorithms}
+
+Figures~\ref{fig:issue-alg} and~\ref{fig:spend-alg} instantiate
+Definition~\ref{def:syntax} against three black-box interfaces: the
+trapdoor map ($P^\ast$, $\Spre$, $\mathsf{KGen}$), the shared XOF
+$\mathcal{H}$, and a non-interactive zero-knowledge argument of knowledge
+$\Pi = (\mathsf{Prove}, \mathsf{Verify})$ for the relations of
+Section~\ref{sec:relation}, where the full typed statement --- including
+$\ctx$ and the credential-kind and settlement-mode tags --- is bound into
+the challenge derivation. Section~\ref{sec:circuit} instantiates $\Pi$ by
+executing each relation as a Boolean circuit under the VOLEitH proof
+system; an implementation of the protocol layer needs only these
+interfaces. $\mathsf{digest}(\ctx, \mathit{req}) =
+\mathcal{H}(\text{``request-digest''} \,\|\, \ctx \,\|\,
+\mathsf{frame}(\mathit{req}))[0{:}256]$ is the exact-retry key.
+
+\begin{figure}[!ht]
+\centering
+\begin{pcvstack}[boxed]
+\procedure{$\mathsf{Setup}(1^\lambda, \mathsf{app})$}{%
+ (\mathsf{sk}, \mathsf{pk}) \sample \mathsf{KGen}(1^\lambda)
+   \quad \pccomment{MAYO trapdoor generation; expand whipped forms} \\
+ h_{\mathsf{pk}} \gets \mathcal{H}(\text{``mayo-pk''} \,\|\,
+   \text{canonical encoding of the expanded } P^\ast) \\
+ \ctx \gets \mathcal{H}(\text{``context''} \,\|\,
+   \mathsf{frame}(\mathsf{app}) \,\|\, h_{\mathsf{pk}} \,\|\,
+   \text{parameter/profile identifiers} \,\|\,
+   \text{balance width})[0{:}256] \\
+ \pcreturn (\mathsf{sk}, \mathsf{pk}, \ctx)}
+\pcvspace
+\begin{pchstack}
+\procedure{$\mathsf{Issue.Client}(\mathsf{pk}, \ctx, b)$}{%
+ \kappa, \rho \sample \{0,1\}^{256} \\
+ (\Cred, \_) \gets \mathsf{CredStream}_{\ctx}(\kappa, b, \rho) \\
+ \pi \sample \Pi.\mathsf{Prove}(\mathcal{R}_{\mathsf{issue}},
+   (\ctx, b, \Cred), (\kappa, \rho)) \\
+ \pcreturn (\mathit{req} = (b, \Cred, \pi),\;
+   \mathit{st} = (\kappa, b, \rho, \Cred))}
+\pchspace
+\procedure{$\mathsf{Issue.Issuer}(\mathsf{sk}, \ctx, (b, \Cred, \pi))$}{%
+ \text{require external authorization for } b \\
+ \text{require } \Pi.\mathsf{Verify}(\mathcal{R}_{\mathsf{issue}},
+   (\ctx, b, \Cred), \pi) \\
+ \pcreturn \sigma \sample \Spre(\mathsf{sk}, \Cred)}
+\end{pchstack}
+\pcvspace
+\procedure{$\mathsf{Issue.Finish}(\mathsf{pk}, \mathit{st}, \sigma)$}{%
+ \text{require } P^\ast(\sigma) = \Cred; \quad
+ \pcreturn T = (\mathsf{Direct}, \sigma, \kappa, b, \rho, t{=}0)}
+\end{pcvstack}
+\caption{Setup and issuance.}
+\label{fig:issue-alg}
+\end{figure}
+
+\begin{figure}[!ht]
+\centering
+\begin{pcvstack}[boxed]
+\procedure{$\mathsf{Spend.Client}(\mathsf{pk}, \ctx, T, s, \mathsf{mode})$}{%
+ \text{require } \mathsf{VerifyToken}(\mathsf{pk}, T) \wedge
+   s \le \mathsf{bal}(T) \\
+ \kappa', \rho' \sample \{0,1\}^{256}; \quad
+   b' \gets \mathsf{bal}(T) - s \\
+ (\Cred', \_) \gets \mathsf{CredStream}_{\ctx}(\kappa', b', \rho');
+   \quad
+ (\_, \Null) \gets \mathsf{CredStream}_{\ctx}(\kappa_T, b_T, \rho_T) \\
+ x \gets (\ctx, \mathsf{kind}(T), \mathsf{mode}, s, \Null, \Cred') \\
+ \pcif \mathsf{kind}(T) = \mathsf{Direct}: \quad
+   w \gets (\sigma_T, \kappa_T, b_T, \rho_T, \kappa', b', \rho') \\
+ \pcelse: \quad
+   w \gets (\sigma_T, \kappa_T, b_T, \rho_T, t_T, \kappa', b', \rho') \\
+ \pi \sample \Pi.\mathsf{Prove}(
+   \mathcal{R}_{\mathsf{spend}}^{\mathsf{kind}(T)}, x, w) \\
+ \pcreturn (\mathit{req} = (\mathsf{kind}(T), \mathsf{mode}, s, \Null,
+   \Cred', \pi),\; \mathit{st} = (\kappa', b', \rho', \Cred', s,
+   \mathsf{mode}))}
+\pcvspace
+\procedure{$\mathsf{Spend.Issuer}(\mathsf{sk}, \ctx, \mathsf{St},
+  \mathit{req}, \mathsf{policy})$}{%
+ \mathit{dig} \gets \mathsf{digest}(\ctx, \mathit{req}) \\
+ \pcif \mathsf{St}[\mathit{req}.\Null] = (\mathit{dig}', \mathit{resp}')
+   \text{ exists:} \quad \pcreturn \mathit{resp}' \text{ if }
+   \mathit{dig}' = \mathit{dig} \text{ else } \bot \\
+ x \gets (\ctx, \mathit{req}.\mathsf{kind}, \mathit{req}.\mathsf{mode},
+   \mathit{req}.s, \mathit{req}.\Null, \mathit{req}.\Cred') \\
+ \text{require } \Pi.\mathsf{Verify}(
+   \mathcal{R}_{\mathsf{spend}}^{\mathit{req}.\mathsf{kind}}, x,
+   \mathit{req}.\pi) \\
+ \pcif \mathit{req}.\mathsf{mode} = \mathsf{Spend}: \quad
+   \mathit{resp} \gets \Spre(\mathsf{sk}, \mathit{req}.\Cred') \\
+ \pcelse: \quad t' \gets \mathsf{policy}(\mathit{req}) \text{ with }
+   0 \le t' \le \mathit{req}.s; \quad
+   \mathit{resp} \gets (t', \Spre(\mathsf{sk},
+   \mathsf{DefTarget}_{\ctx}(\mathit{req}.\Cred', t'))) \\
+ \text{\emph{atomically} insert } \mathsf{St}[\mathit{req}.\Null] \gets
+   (\mathit{dig}, \mathit{resp});
+   \text{ let } (\mathit{dig}^\ast, \mathit{resp}^\ast)
+   \text{ be the durable record} \\
+ \pcreturn \mathit{resp}^\ast \text{ if } \mathit{dig}^\ast =
+   \mathit{dig} \text{ else } \bot}
+\pcvspace
+\procedure{$\mathsf{Spend.Finish}(\mathsf{pk}, \mathit{st},
+  \mathit{resp})$}{%
+ \pcif \mathit{st}.\mathsf{mode} = \mathsf{Spend}: \quad
+   \sigma' \gets \mathit{resp};
+   \text{ require } P^\ast(\sigma') = \Cred';
+   \pcreturn (\mathsf{Direct}, \sigma', \kappa', b', \rho', 0) \\
+ (t', \sigma') \gets \mathit{resp};
+   \text{ require } t' \le \mathit{st}.s \wedge
+   P^\ast(\sigma') = \mathsf{DefTarget}_{\ctx}(\Cred', t') \\
+ \pcreturn (\mathsf{Deferred}, \sigma', \kappa', b', \rho', t')}
+\end{pcvstack}
+\caption{Spending, both settlement modes. $\mathsf{policy}$ is the
+issuer's return-selection function; the durable-record comparison
+implements exact-retry replay and conflicting-reuse rejection under
+concurrent insertion.}
+\label{fig:spend-alg}
+\end{figure}
+
+The client-side requirement $\mathsf{VerifyToken}$ and the finish-time
+checks are the complete authentication surface the anonymity game relies
+on. An ordinary spend of a deferred-return token folds the old return
+into $b'$ and restores the cheaper direct format; the issuer verifies,
+signs, and durably stores the response under $\Null$, so exact
+retransmissions replay and a network failure cannot burn a balance.
 
 \section{The proof circuit}
 \label{sec:circuit}
