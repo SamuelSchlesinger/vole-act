@@ -5,6 +5,7 @@ use crate::params::MayoParams;
 use binary_fields::{BinaryField, GF16};
 use core::marker::PhantomData;
 use rand_core::CryptoRngCore;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// Errors from the MAYO algorithms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -14,6 +15,9 @@ pub enum MayoError {
     PreimageSamplingFailed,
     /// An input had the wrong length.
     InvalidLength,
+    /// A canonical expanded-key encoding was malformed, non-canonical, or
+    /// carried a different MAYO parameter-set identifier.
+    InvalidEncoding,
 }
 
 impl core::fmt::Display for MayoError {
@@ -21,6 +25,7 @@ impl core::fmt::Display for MayoError {
         match self {
             MayoError::PreimageSamplingFailed => write!(f, "preimage sampling failed"),
             MayoError::InvalidLength => write!(f, "input has invalid length"),
+            MayoError::InvalidEncoding => write!(f, "invalid MAYO key encoding"),
         }
     }
 }
@@ -43,6 +48,95 @@ pub struct SecretKey<P: MayoParams> {
     p1: Vec<Mat>,
     l: Vec<Mat>,
     _params: PhantomData<P>,
+}
+
+impl<P: MayoParams> Drop for SecretKey<P> {
+    fn drop(&mut self) {
+        self.o.zeroize();
+        self.p1.zeroize();
+        self.l.zeroize();
+    }
+}
+
+impl<P: MayoParams> ZeroizeOnDrop for SecretKey<P> {}
+
+const PUBLIC_KEY_MAGIC: &[u8; 5] = b"MYPK\x01";
+const SECRET_KEY_MAGIC: &[u8; 5] = b"MYSK\x01";
+
+fn push_nibble(out: &mut Vec<u8>, index: usize, value: GF16) {
+    if index.is_multiple_of(2) {
+        out.push(value.to_u8());
+    } else {
+        *out.last_mut().expect("odd nibble has preceding byte") |= value.to_u8() << 4;
+    }
+}
+
+fn append_matrix(out: &mut Vec<u8>, nibble_index: &mut usize, matrix: &Mat, upper: bool) {
+    for row in 0..matrix.rows() {
+        let start = if upper { row } else { 0 };
+        for column in start..matrix.cols() {
+            push_nibble(out, *nibble_index, matrix[(row, column)]);
+            *nibble_index += 1;
+        }
+    }
+}
+
+struct NibbleReader<'a> {
+    bytes: &'a [u8],
+    count: usize,
+    next: usize,
+}
+
+impl<'a> NibbleReader<'a> {
+    fn new(bytes: &'a [u8], count: usize) -> Result<Self, MayoError> {
+        let expected = count.checked_add(1).ok_or(MayoError::InvalidEncoding)? / 2;
+        if bytes.len() != expected
+            || (count % 2 == 1 && bytes.last().is_some_and(|b| b & 0xf0 != 0))
+        {
+            return Err(MayoError::InvalidEncoding);
+        }
+        Ok(Self {
+            bytes,
+            count,
+            next: 0,
+        })
+    }
+
+    fn nibble(&mut self) -> Result<GF16, MayoError> {
+        if self.next >= self.count {
+            return Err(MayoError::InvalidEncoding);
+        }
+        let byte = self.bytes[self.next / 2];
+        let value = if self.next.is_multiple_of(2) {
+            byte & 0x0f
+        } else {
+            byte >> 4
+        };
+        self.next += 1;
+        Ok(GF16::new(value))
+    }
+
+    fn matrix(&mut self, rows: usize, cols: usize, upper: bool) -> Result<Mat, MayoError> {
+        let len = rows.checked_mul(cols).ok_or(MayoError::InvalidEncoding)?;
+        let mut data = vec![GF16::ZERO; len];
+        for row in 0..rows {
+            let start = if upper { row } else { 0 };
+            for column in start..cols {
+                data[row * cols + column] = self.nibble()?;
+            }
+        }
+        Mat::from_data(rows, cols, data).ok_or(MayoError::InvalidEncoding)
+    }
+
+    fn finish(self) -> Result<(), MayoError> {
+        (self.next == self.count)
+            .then_some(())
+            .ok_or(MayoError::InvalidEncoding)
+    }
+}
+
+const fn upper_entries(dimension: usize) -> usize {
+    dimension * (dimension + 1) / 2
 }
 
 /// Key generation (spec Algorithm 4, math level).
@@ -88,6 +182,156 @@ pub fn trapgen<P: MayoParams>(rng: &mut impl CryptoRngCore) -> (SecretKey<P>, Pu
     )
 }
 
+impl<P: MayoParams> PublicKey<P> {
+    /// Encode the expanded public quadratic map canonically.
+    ///
+    /// This is a stable, versioned mathematical-key format. It deliberately
+    /// does not claim interoperability with MAYO's seed-compressed signature
+    /// API: VOLE-ACT consumes the expanded trapdoor map directly.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let nibble_count = P::M * (upper_entries(P::V) + P::V * P::O + upper_entries(P::O));
+        let mut body = Vec::with_capacity(nibble_count.div_ceil(2));
+        let mut index = 0;
+        for equation in 0..P::M {
+            append_matrix(&mut body, &mut index, &self.p1[equation], true);
+            append_matrix(&mut body, &mut index, &self.p2[equation], false);
+            append_matrix(&mut body, &mut index, &self.p3[equation], true);
+        }
+        debug_assert_eq!(index, nibble_count);
+        let mut out = Vec::with_capacity(PUBLIC_KEY_MAGIC.len() + 1 + body.len());
+        out.extend_from_slice(PUBLIC_KEY_MAGIC);
+        out.push(P::WIRE_ID);
+        out.extend_from_slice(&body);
+        body.zeroize();
+        out
+    }
+
+    /// Decode a canonical expanded public quadratic map.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, MayoError> {
+        if bytes.len() < PUBLIC_KEY_MAGIC.len() + 1
+            || &bytes[..PUBLIC_KEY_MAGIC.len()] != PUBLIC_KEY_MAGIC
+            || bytes[PUBLIC_KEY_MAGIC.len()] != P::WIRE_ID
+        {
+            return Err(MayoError::InvalidEncoding);
+        }
+        let nibble_count = P::M
+            .checked_mul(
+                upper_entries(P::V)
+                    .checked_add(P::V * P::O)
+                    .and_then(|n| n.checked_add(upper_entries(P::O)))
+                    .ok_or(MayoError::InvalidEncoding)?,
+            )
+            .ok_or(MayoError::InvalidEncoding)?;
+        let mut reader = NibbleReader::new(&bytes[PUBLIC_KEY_MAGIC.len() + 1..], nibble_count)?;
+        let mut p1 = Vec::with_capacity(P::M);
+        let mut p2 = Vec::with_capacity(P::M);
+        let mut p3 = Vec::with_capacity(P::M);
+        for _ in 0..P::M {
+            p1.push(reader.matrix(P::V, P::V, true)?);
+            p2.push(reader.matrix(P::V, P::O, false)?);
+            p3.push(reader.matrix(P::O, P::O, true)?);
+        }
+        reader.finish()?;
+        Ok(Self {
+            p1,
+            p2,
+            p3,
+            _params: PhantomData,
+        })
+    }
+}
+
+impl<P: MayoParams> SecretKey<P> {
+    /// Reconstruct the public map determined by this expanded trapdoor.
+    ///
+    /// Storing only `(O, P1, L)` prevents a serialized issuer key from
+    /// carrying a mismatched public key. In characteristic two,
+    /// `P2 = L + (P1 + P1^T) O`; `P3` then follows from the MAYO key relation.
+    #[must_use]
+    pub fn public_key(&self) -> PublicKey<P> {
+        let ot = self.o.transpose();
+        let mut p2 = Vec::with_capacity(P::M);
+        let mut p3 = Vec::with_capacity(P::M);
+        for equation in 0..P::M {
+            let symmetric_o = self.p1[equation]
+                .add(&self.p1[equation].transpose())
+                .mul(&self.o);
+            let p2_equation = self.l[equation].add(&symmetric_o);
+            let p3_equation = ot
+                .mul(&self.p1[equation].mul(&self.o))
+                .add(&ot.mul(&p2_equation))
+                .upper();
+            p2.push(p2_equation);
+            p3.push(p3_equation);
+        }
+        PublicKey {
+            p1: self.p1.clone(),
+            p2,
+            p3,
+            _params: PhantomData,
+        }
+    }
+
+    /// Encode the expanded issuer trapdoor canonically.
+    ///
+    /// The returned bytes are secret key material and must be protected at
+    /// rest. The format stores `(O, P1, L)` and derives the public map during
+    /// decoding, so no attacker-controlled public/secret mismatch is possible.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let nibble_count = P::V * P::O + P::M * (upper_entries(P::V) + P::V * P::O);
+        let mut body = Vec::with_capacity(nibble_count.div_ceil(2));
+        let mut index = 0;
+        append_matrix(&mut body, &mut index, &self.o, false);
+        for equation in 0..P::M {
+            append_matrix(&mut body, &mut index, &self.p1[equation], true);
+            append_matrix(&mut body, &mut index, &self.l[equation], false);
+        }
+        debug_assert_eq!(index, nibble_count);
+        let mut out = Vec::with_capacity(SECRET_KEY_MAGIC.len() + 1 + body.len());
+        out.extend_from_slice(SECRET_KEY_MAGIC);
+        out.push(P::WIRE_ID);
+        out.extend_from_slice(&body);
+        body.zeroize();
+        out
+    }
+
+    /// Decode a canonical expanded issuer trapdoor.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, MayoError> {
+        if bytes.len() < SECRET_KEY_MAGIC.len() + 1
+            || &bytes[..SECRET_KEY_MAGIC.len()] != SECRET_KEY_MAGIC
+            || bytes[SECRET_KEY_MAGIC.len()] != P::WIRE_ID
+        {
+            return Err(MayoError::InvalidEncoding);
+        }
+        let per_equation = upper_entries(P::V)
+            .checked_add(P::V * P::O)
+            .ok_or(MayoError::InvalidEncoding)?;
+        let nibble_count = (P::V * P::O)
+            .checked_add(
+                P::M.checked_mul(per_equation)
+                    .ok_or(MayoError::InvalidEncoding)?,
+            )
+            .ok_or(MayoError::InvalidEncoding)?;
+        let mut reader = NibbleReader::new(&bytes[SECRET_KEY_MAGIC.len() + 1..], nibble_count)?;
+        let o = reader.matrix(P::V, P::O, false)?;
+        let mut p1 = Vec::with_capacity(P::M);
+        let mut l = Vec::with_capacity(P::M);
+        for _ in 0..P::M {
+            p1.push(reader.matrix(P::V, P::V, true)?);
+            l.push(reader.matrix(P::V, P::O, false)?);
+        }
+        reader.finish()?;
+        Ok(Self {
+            o,
+            p1,
+            l,
+            _params: PhantomData,
+        })
+    }
+}
+
 /// Multiply an `F₁₆^M`-vector (viewed as a polynomial in `F₁₆[z]/f(z)`) by
 /// `z^shift` — the `E^ℓ` matrix action of the spec.
 fn mul_z_pow<P: MayoParams>(u: &[GF16], shift: usize) -> Vec<GF16> {
@@ -100,10 +344,8 @@ fn mul_z_pow<P: MayoParams>(u: &[GF16], shift: usize) -> Vec<GF16> {
             out[i] = out[i - 1];
         }
         out[0] = GF16::ZERO;
-        if top != GF16::ZERO {
-            for &(d, coeff) in P::F_TAIL {
-                out[d] += top * GF16::new(coeff);
-            }
+        for &(d, coeff) in P::F_TAIL {
+            out[d] += top * GF16::new(coeff);
         }
     }
     out
@@ -165,6 +407,90 @@ pub fn eval<P: MayoParams>(pk: &PublicKey<P>, s: &[GF16]) -> Result<Vec<GF16>, M
     Ok(y)
 }
 
+impl<P: MayoParams> PublicKey<P> {
+    /// The full `n × n` matrix `M_b = ((P1_b, P2_b), (0, P3_b))` for
+    /// equation `b`, whose quadratic form is the base map: `s_i^T M_b s_i`.
+    fn full_matrix(&self, b: usize) -> Mat {
+        let (n, v, o) = (P::N, P::V, P::O);
+        let mut m = Mat::zero(n, n);
+        for r in 0..v {
+            for c in 0..v {
+                m[(r, c)] = self.p1[b][(r, c)];
+            }
+            for c in 0..o {
+                m[(r, v + c)] = self.p2[b][(r, c)];
+            }
+        }
+        for r in 0..o {
+            for c in 0..o {
+                m[(v + r, v + c)] = self.p3[b][(r, c)];
+            }
+        }
+        m
+    }
+
+    /// The `m` whipped quadratic forms `G_a ∈ F₁₆^{kn×kn}` (upper triangular)
+    /// with `eval(pk, s)_a = sᵀ G_a s` — the representation the VOLE-ACT
+    /// circuit proves against.
+    ///
+    /// Cost is `O(m·(kn)²)` space; intended for the smaller parameter sets
+    /// (e.g. MAYO₂, `kn = 324`). Larger sets want a structured, non-
+    /// materialized QuickSilver check (a documented future optimization).
+    #[must_use]
+    pub fn whipped_forms(&self) -> Vec<Mat> {
+        let (n, k, m, kn) = (P::N, P::K, P::M, P::KN);
+        // E^ℓ as an m×m matrix: column b is z^ℓ · z^b reduced mod f.
+        let e_pow = |ell: usize| -> Vec<Vec<GF16>> {
+            (0..m)
+                .map(|b| {
+                    let mut unit = vec![GF16::ZERO; m];
+                    unit[b] = GF16::ONE;
+                    mul_z_pow::<P>(&unit, ell)
+                })
+                .collect()
+        };
+        let full: Vec<Mat> = (0..m).map(|b| self.full_matrix(b)).collect();
+
+        let mut g = vec![Mat::zero(kn, kn); m];
+        let mut ell = 0;
+        for i in 0..k {
+            for j in (i..k).rev() {
+                let e_cols = e_pow(ell); // e_cols[b][a] = [E^ℓ]_{a,b}
+                for (b, mb) in full.iter().enumerate() {
+                    // Base placement: block (i,j) of the kn×kn form.
+                    let (ri0, cj0) = (i * n, j * n);
+                    for a in 0..m {
+                        let coeff = e_cols[b][a];
+                        if coeff == GF16::ZERO {
+                            continue;
+                        }
+                        let ga = &mut g[a];
+                        if i == j {
+                            // sᵢᵀ Mb sᵢ → place Upper(coeff·Mb) on the diagonal block.
+                            for r in 0..n {
+                                ga[(ri0 + r, ri0 + r)] += coeff * mb[(r, r)];
+                                for c in (r + 1)..n {
+                                    ga[(ri0 + r, ri0 + c)] += coeff * (mb[(r, c)] + mb[(c, r)]);
+                                }
+                            }
+                        } else {
+                            // sᵢᵀ Mb sⱼ + sⱼᵀ Mb sᵢ = sᵢᵀ(Mb+Mbᵀ)sⱼ → off-diagonal
+                            // block (i<j, so already upper-triangular).
+                            for r in 0..n {
+                                for c in 0..n {
+                                    ga[(ri0 + r, cj0 + c)] += coeff * (mb[(r, c)] + mb[(c, r)]);
+                                }
+                            }
+                        }
+                    }
+                }
+                ell += 1;
+            }
+        }
+        g
+    }
+}
+
 /// Sample a preimage `s` with `P*(s) = t` using the oil-space trapdoor
 /// (spec Algorithm 7, lines 13–45, with RNG-supplied randomness instead of
 /// seed-derived counters).
@@ -180,13 +506,13 @@ pub fn spre<P: MayoParams>(
 
     for _attempt in 0..256 {
         // Fresh vinegar values and system randomness.
-        let vinegar: Vec<Vec<GF16>> = (0..k)
+        let mut vinegar: Vec<Vec<GF16>> = (0..k)
             .map(|_| (0..v).map(|_| GF16::random(rng)).collect())
             .collect();
-        let r: Vec<GF16> = (0..k * o).map(|_| GF16::random(rng)).collect();
+        let mut r: Vec<GF16> = (0..k * o).map(|_| GF16::random(rng)).collect();
 
         // M_i ∈ F^{m×o} with M_i[a,:] = v_iᵀ L_a.
-        let m_mats: Vec<Mat> = (0..k)
+        let mut m_mats: Vec<Mat> = (0..k)
             .map(|i| {
                 let mut mi = Mat::zero(m, o);
                 for a in 0..m {
@@ -200,7 +526,7 @@ pub fn spre<P: MayoParams>(
             .collect();
 
         // Precompute w[a][j] = P1_a · v_j for the vinegar quadratic forms.
-        let w: Vec<Vec<Vec<GF16>>> = (0..m)
+        let mut w: Vec<Vec<Vec<GF16>>> = (0..m)
             .map(|a| (0..k).map(|j| sk.p1[a].mul_vec(&vinegar[j])).collect())
             .collect();
         let dot = |x: &[GF16], y: &[GF16]| {
@@ -238,7 +564,13 @@ pub fn spre<P: MayoParams>(
             }
         }
 
-        let Some(x) = sample_solution(&a_mat, &y, &r) else {
+        let Some(mut x) = sample_solution(&a_mat, &y, &r) else {
+            vinegar.zeroize();
+            r.zeroize();
+            m_mats.zeroize();
+            w.zeroize();
+            a_mat.zeroize();
+            y.zeroize();
             continue;
         };
 
@@ -259,6 +591,13 @@ pub fn spre<P: MayoParams>(
                 s[i * n + v + idx] = *val;
             }
         }
+        vinegar.zeroize();
+        r.zeroize();
+        m_mats.zeroize();
+        w.zeroize();
+        a_mat.zeroize();
+        y.zeroize();
+        x.zeroize();
         return Ok(s);
     }
     Err(MayoError::PreimageSamplingFailed)
@@ -346,6 +685,35 @@ mod tests {
         assert_ne!(eval(&pk, &s).unwrap(), t);
     }
 
+    fn whipped_forms_match_eval<P: MayoParams>(seed: u64) {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let (_sk, pk) = trapgen::<P>(&mut rng);
+        let forms = pk.whipped_forms();
+        assert_eq!(forms.len(), P::M);
+        for _ in 0..3 {
+            let s: Vec<GF16> = (0..P::KN).map(|_| GF16::random(&mut rng)).collect();
+            let evaluated = eval(&pk, &s).unwrap();
+            for (a, g_a) in forms.iter().enumerate() {
+                assert_eq!(
+                    g_a.quad_form(&s),
+                    evaluated[a],
+                    "{} equation {a}: sᵀG_a s != eval_a",
+                    P::NAME
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn whipped_forms_match_eval_mayo2() {
+        whipped_forms_match_eval::<Mayo2>(30);
+    }
+
+    #[test]
+    fn whipped_forms_match_eval_mayo1() {
+        whipped_forms_match_eval::<Mayo1>(31);
+    }
+
     #[test]
     fn eval_rejects_wrong_lengths() {
         let mut rng = StdRng::seed_from_u64(15);
@@ -357,6 +725,49 @@ mod tests {
         assert_eq!(
             spre(&sk, &[GF16::ZERO; 5], &mut rng).unwrap_err(),
             MayoError::InvalidLength
+        );
+    }
+
+    #[test]
+    fn expanded_key_codecs_are_canonical_and_consistent() {
+        let mut rng = StdRng::seed_from_u64(0xC0DE_CAFE);
+        let (secret, public) = trapgen::<Mayo2>(&mut rng);
+
+        let public_bytes = public.to_bytes();
+        let decoded_public = PublicKey::<Mayo2>::from_bytes(&public_bytes).unwrap();
+        assert_eq!(decoded_public.to_bytes(), public_bytes);
+
+        let secret_bytes = secret.to_bytes();
+        let decoded_secret = SecretKey::<Mayo2>::from_bytes(&secret_bytes).unwrap();
+        assert_eq!(decoded_secret.to_bytes(), secret_bytes);
+        let derived_public = decoded_secret.public_key();
+        assert_eq!(derived_public.to_bytes(), public_bytes);
+
+        let target = random_target::<Mayo2>(&mut rng);
+        let preimage = spre(&decoded_secret, &target, &mut rng).unwrap();
+        assert_eq!(eval(&derived_public, &preimage).unwrap(), target);
+
+        for encoded in [&public_bytes, &secret_bytes] {
+            let mut trailing = encoded.clone();
+            trailing.push(0);
+            if encoded.starts_with(PUBLIC_KEY_MAGIC) {
+                assert_eq!(
+                    PublicKey::<Mayo2>::from_bytes(&trailing).err(),
+                    Some(MayoError::InvalidEncoding)
+                );
+            } else {
+                assert_eq!(
+                    SecretKey::<Mayo2>::from_bytes(&trailing).err(),
+                    Some(MayoError::InvalidEncoding)
+                );
+            }
+        }
+
+        let mut wrong_parameter = public_bytes;
+        wrong_parameter[PUBLIC_KEY_MAGIC.len()] = Mayo1::WIRE_ID;
+        assert_eq!(
+            PublicKey::<Mayo2>::from_bytes(&wrong_parameter).err(),
+            Some(MayoError::InvalidEncoding)
         );
     }
 }

@@ -2,13 +2,13 @@
 //!
 //! A non-interactive zero-knowledge proof system for Boolean/arithmetic
 //! circuits over committed bits, in the style of FAEST / Baum et al.'s
-//! VOLEitH with a QuickSilver-style degree-2 check:
+//! VOLEitH with a generalized QuickSilver-style polynomial check:
 //!
 //! 1. τ GGM trees ([`vector-commit`](vector_commit)) commit pseudorandom
 //!    seeds; all-but-one openings yield **VOLE correlations**
 //!    `K_t = V_t + u_t·Δ` over `F₂^λ` ([`vole`]).
-//! 2. Committed witness bits support free linear operations and χ-batched
-//!    degree-2 (`a·b = c`) constraints ([`backend`]).
+//! 2. Committed witness bits support free linear operations, quadratic systems,
+//!    and χ-batched polynomial constraints through degree 16 ([`backend`]).
 //! 3. Fiat–Shamir ([`transcript`]) makes the whole thing non-interactive;
 //!    a coefficient-hash **consistency check** binds all τ repetitions to a
 //!    single committed `u` ([`proof`] documents the exact flow).
@@ -25,8 +25,8 @@ pub mod transcript;
 pub mod vole;
 
 pub use backend::{Backend, Circuit, CountingBackend, ProverBackend, QuadTerm, VerifierBackend};
-pub use proof::{Proof, prove, verify};
-pub use vole::{PARAMS_128, Params};
+pub use proof::{MAX_PROOF_WIRE_BYTES, Proof, ProofDecodeError, prove, verify};
+pub use vole::{PARAMS_128, PARAMS_128_BALANCED, PARAMS_128_FAST, Params};
 
 /// Errors from proving or verifying.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

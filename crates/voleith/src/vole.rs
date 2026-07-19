@@ -34,17 +34,31 @@ pub struct Params {
 /// λ = 128 with τ = 16 trees of depth 8 (256 leaves each).
 pub const PARAMS_128: Params = Params { tau: 16, k: 8 };
 
+/// Balanced λ = 128 point with τ = 32 trees of depth 4. This expands 512
+/// leaves rather than 4096 while keeping correction data moderate.
+pub const PARAMS_128_BALANCED: Params = Params { tau: 32, k: 4 };
+
+/// Lowest-latency built-in λ = 128 point with τ = 64 trees of depth 2.
+/// This expands only 256 leaves, at the cost of approximately twice the
+/// correction data of [`PARAMS_128_BALANCED`].
+pub const PARAMS_128_FAST: Params = Params { tau: 64, k: 2 };
+
 impl Params {
     /// The security parameter λ = τ·k in bits.
     #[must_use]
     pub const fn lambda(&self) -> usize {
-        self.tau * self.k
+        self.tau.saturating_mul(self.k)
     }
 
-    /// Leaves per tree.
+    /// Leaves per tree, or zero when `k` is not representable as a `usize`
+    /// shift (such a parameter set is rejected by proving and verification).
     #[must_use]
     pub const fn leaves(&self) -> usize {
-        1 << self.k
+        if self.k >= usize::BITS as usize {
+            0
+        } else {
+            1 << self.k
+        }
     }
 
     /// Reject unsupported parameters *before* any cryptographic work, so
@@ -122,8 +136,9 @@ impl ProverVole {
         l_hat: usize,
         params: &Params,
     ) -> Result<Self, VcError> {
-        assert_eq!(params.lambda(), 128, "only λ = 128 is supported");
-        assert_eq!(root_seeds.len(), params.tau);
+        if params.validate().is_err() || root_seeds.len() != params.tau {
+            return Err(VcError::InvalidParameters);
+        }
 
         let mut trees = Vec::with_capacity(params.tau);
         let mut coms = Vec::with_capacity(params.tau);
@@ -171,7 +186,9 @@ impl ProverVole {
 
     /// Open every tree at all leaves except the challenge indices `deltas`.
     pub fn open(&self, deltas: &[usize]) -> Result<Vec<VcOpening>, VcError> {
-        assert_eq!(deltas.len(), self.trees.len());
+        if deltas.len() != self.trees.len() {
+            return Err(VcError::InvalidParameters);
+        }
         self.trees
             .iter()
             .zip(deltas.iter())
@@ -192,7 +209,9 @@ pub fn reconstruct_keys(
     deltas: &[usize],
     openings: &[VcOpening],
 ) -> Result<Vec<GF2p128>, VcError> {
-    assert_eq!(params.lambda(), 128, "only λ = 128 is supported");
+    if params.validate().is_err() {
+        return Err(VcError::InvalidParameters);
+    }
     if coms.len() != params.tau
         || corrections.len() != params.tau - 1
         || deltas.len() != params.tau
@@ -241,14 +260,25 @@ pub fn reconstruct_keys(
 }
 
 /// Interpret a λ-bit challenge as the field element `Δ` and its τ chunk
-/// indices `Δⱼ` (bits `[jk, jk+k)`).
+/// indices `Δⱼ` (bits `[jk, jk+k)`). Invalid parameter geometry returns the
+/// field element together with an empty chunk list, without allocating from
+/// attacker-controlled dimensions; proving and verification reject the same
+/// geometry with [`crate::VoleithError::InvalidParameters`].
 #[must_use]
 pub fn split_delta(chall: &[u8; 16], params: &Params) -> (GF2p128, Vec<usize>) {
     let delta = GF2p128::from_bytes(*chall);
+    if params.validate().is_err() {
+        return (delta, Vec::new());
+    }
     let bits = u128::from_le_bytes(*chall);
     let mask = (1u128 << params.k) - 1;
     let chunks = (0..params.tau)
-        .map(|j| ((bits >> (j * params.k)) & mask) as usize)
+        .map(|j| {
+            j.checked_mul(params.k)
+                .and_then(|offset| u32::try_from(offset).ok())
+                .and_then(|offset| bits.checked_shr(offset))
+                .map_or(0, |shifted| (shifted & mask) as usize)
+        })
         .collect();
     (delta, chunks)
 }
@@ -333,5 +363,33 @@ mod tests {
             };
             assert_ne!(keys[3], expected);
         }
+    }
+
+    #[test]
+    fn invalid_public_parameters_fail_without_panicking() {
+        let invalid = Params { tau: 1, k: 128 };
+        assert_eq!(invalid.leaves(), 0);
+        assert_eq!(
+            ProverVole::commit(&[[0u8; 16]], &[0u8; 16], 8, &invalid).err(),
+            Some(VcError::InvalidParameters)
+        );
+        let (_, chunks) = split_delta(&[0u8; 16], &invalid);
+        assert!(chunks.is_empty());
+
+        let overflowing = Params {
+            tau: usize::MAX,
+            k: usize::MAX,
+        };
+        assert_eq!(overflowing.lambda(), usize::MAX);
+        assert_eq!(overflowing.leaves(), 0);
+        let (_, chunks) = split_delta(&[0u8; 16], &overflowing);
+        assert!(chunks.is_empty());
+
+        let allocation_attack = Params {
+            tau: u32::MAX as usize,
+            k: 24,
+        };
+        let (_, chunks) = split_delta(&[0u8; 16], &allocation_attack);
+        assert!(chunks.is_empty());
     }
 }

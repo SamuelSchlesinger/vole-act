@@ -1,13 +1,13 @@
 //! The non-interactive proof: orchestration of VOLE commitment, the
 //! consistency check, the batched QuickSilver check, and Fiat–Shamir.
 //!
-//! ## Coordinate layout (ℓ̂ = ℓ + 2λ)
+//! ## Coordinate layout (ℓ̂ = ℓ + dλ)
 //!
 //! | range            | use                                   |
 //! |------------------|---------------------------------------|
 //! | `[0, ℓ)`         | witness bits                          |
-//! | `[ℓ, ℓ+λ)`       | QuickSilver mask (`u*`, `v*`)         |
-//! | `[ℓ+λ, ℓ+2λ)`    | consistency-check mask (`m_u`, `m_v`) |
+//! | `[ℓ, ℓ+(d−1)λ)` | `d−1` QuickSilver polynomial masks |
+//! | `[ℓ+(d−1)λ, ℓ+dλ)` | wide-consistency-hash mask       |
 //!
 //! ## Transcript order
 //!
@@ -22,8 +22,10 @@
 //! ## Checks performed by the verifier
 //!
 //! 1. Vector-commitment openings against the τ tree commitments at `Δⱼ`.
-//! 2. Consistency: `Σₜ αₜ·Kₜ + K_m = ṽ + ũ·Δ` over the u-stage keys —
-//!    forces all repetitions to share one `u` (up to the masked coords).
+//! 2. Consistency: a 128-bit, column-wise linear universal hash preserves
+//!    `Q̃ = Ṽ + ũ·Δ` — forcing all small-VOLE repetitions to share
+//!    one `u`. A scalar field hash is not sufficient here: a prover could
+//!    otherwise target one `k`-bit challenge chunk with probability `2⁻ᵏ`.
 //! 3. QuickSilver: `Σᵢ χᵢ·Bᵢ + Q* = W + U·Δ` over the witness-stage keys —
 //!    forces every circuit constraint.
 
@@ -37,9 +39,39 @@ use crate::vole::{Params, ProverVole, reconstruct_keys, split_delta};
 use binary_fields::{BinaryField, GF2p128};
 use rand_core::CryptoRngCore;
 use sha3::digest::XofReader;
-use vector_commit::{Seed, VcCommitment, VcOpening};
+use vector_commit::{MAX_DEPTH, Seed, VcCommitment, VcOpening};
 
 const PROTOCOL_LABEL: &[u8] = b"VOLE-ACT/voleith/v1";
+const MAX_DEGREE: usize = 16;
+const PROOF_WIRE_MAGIC: &[u8; 5] = b"VITH\x01";
+
+/// Maximum canonical proof encoding accepted by [`Proof::from_bytes`].
+///
+/// The shipped ACT circuits are below 300 KiB.  The larger ceiling leaves
+/// room for other circuits while preventing attacker-controlled length fields
+/// from causing unbounded allocation before proof-shape validation.
+pub const MAX_PROOF_WIRE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Failure to decode a canonical VOLE-in-the-head proof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProofDecodeError {
+    /// The input is truncated, has a wrong type/version tag, contains a
+    /// non-canonical bit vector, has impossible lengths, or has trailing data.
+    InvalidEncoding,
+    /// The encoded proof exceeds [`MAX_PROOF_WIRE_BYTES`].
+    TooLarge,
+}
+
+impl core::fmt::Display for ProofDecodeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::InvalidEncoding => write!(f, "invalid canonical proof encoding"),
+            Self::TooLarge => write!(f, "proof encoding exceeds the configured limit"),
+        }
+    }
+}
+
+impl std::error::Error for ProofDecodeError {}
 
 /// A non-interactive VOLE-in-the-head proof.
 #[derive(Clone, Debug)]
@@ -54,14 +86,235 @@ pub struct Proof {
     pub d: BitVec,
     /// Consistency check: masked coefficient-hash of `u`.
     pub u_tilde: GF2p128,
-    /// Consistency check: masked coefficient-hash of the tags.
-    pub v_tilde: GF2p128,
-    /// QuickSilver: masked `Σ χᵢ·A₁⁽ⁱ⁾`.
-    pub qs_u: GF2p128,
-    /// QuickSilver: masked `Σ χᵢ·A₀⁽ⁱ⁾`.
-    pub qs_w: GF2p128,
+    /// Consistency check: the 128 rows of the column-wise hash of the tag
+    /// matrix. Each field element packs one 128-bit output row.
+    pub v_tilde: Vec<GF2p128>,
+    /// Masked coefficients of the batched QuickSilver polynomial, in
+    /// low-to-high order. Its length is the circuit's maximum degree.
+    pub qs_coefficients: Vec<GF2p128>,
     /// All-but-one openings of the τ trees.
     pub openings: Vec<VcOpening>,
+}
+
+impl Proof {
+    /// Size of the proof's fixed-layout cryptographic payload in bytes.
+    ///
+    /// This counts every field, bit vector, seed, and commitment exactly once,
+    /// but not container length prefixes a particular wire codec may add.
+    #[must_use]
+    pub fn payload_len(&self) -> usize {
+        16 + self.coms.len() * 32
+            + self
+                .corrections
+                .iter()
+                .map(|correction| correction.as_bytes().len())
+                .sum::<usize>()
+            + self.d.as_bytes().len()
+            + 16
+            + self.v_tilde.len() * 16
+            + self.qs_coefficients.len() * 16
+            + self
+                .openings
+                .iter()
+                .map(|opening| opening.siblings.len() * 16 + 32)
+                .sum::<usize>()
+    }
+
+    /// Encode this proof in the canonical, versioned wire format.
+    ///
+    /// Integer lengths are little-endian. Bit vectors carry their logical bit
+    /// length and must have zero unused high bits; decoding rejects trailing
+    /// bytes and all alternate encodings of the same proof.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.payload_len() + 128);
+        out.extend_from_slice(PROOF_WIRE_MAGIC);
+        out.extend_from_slice(&self.salt);
+
+        put_len(&mut out, self.coms.len());
+        for commitment in &self.coms {
+            out.extend_from_slice(&commitment.0);
+        }
+
+        put_len(&mut out, self.corrections.len());
+        for correction in &self.corrections {
+            put_bits(&mut out, correction);
+        }
+        put_bits(&mut out, &self.d);
+        out.extend_from_slice(&self.u_tilde.to_bytes());
+
+        put_len(&mut out, self.v_tilde.len());
+        for row in &self.v_tilde {
+            out.extend_from_slice(&row.to_bytes());
+        }
+
+        put_len(&mut out, self.qs_coefficients.len());
+        for coefficient in &self.qs_coefficients {
+            out.extend_from_slice(&coefficient.to_bytes());
+        }
+
+        put_len(&mut out, self.openings.len());
+        for opening in &self.openings {
+            put_len(&mut out, opening.siblings.len());
+            for sibling in &opening.siblings {
+                out.extend_from_slice(sibling);
+            }
+            out.extend_from_slice(&opening.hidden_com);
+        }
+        out
+    }
+
+    /// Decode a proof from the canonical, versioned wire format.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ProofDecodeError> {
+        if bytes.len() > MAX_PROOF_WIRE_BYTES {
+            return Err(ProofDecodeError::TooLarge);
+        }
+        let mut decoder = ProofDecoder::new(bytes);
+        decoder.expect(PROOF_WIRE_MAGIC)?;
+        let salt = decoder.array()?;
+
+        let com_count = decoder.count(32, 128)?;
+        let mut coms = Vec::with_capacity(com_count);
+        for _ in 0..com_count {
+            coms.push(VcCommitment(decoder.array()?));
+        }
+
+        let correction_count = decoder.count(8, 127)?;
+        let mut corrections = Vec::with_capacity(correction_count);
+        for _ in 0..correction_count {
+            corrections.push(decoder.bits()?);
+        }
+        let d = decoder.bits()?;
+        let u_tilde = GF2p128::from_bytes(decoder.array()?);
+
+        let v_count = decoder.count(16, 128)?;
+        let mut v_tilde = Vec::with_capacity(v_count);
+        for _ in 0..v_count {
+            v_tilde.push(GF2p128::from_bytes(decoder.array()?));
+        }
+
+        let coefficient_count = decoder.count(16, MAX_DEGREE)?;
+        let mut qs_coefficients = Vec::with_capacity(coefficient_count);
+        for _ in 0..coefficient_count {
+            qs_coefficients.push(GF2p128::from_bytes(decoder.array()?));
+        }
+
+        let opening_count = decoder.count(36, 128)?;
+        let mut openings = Vec::with_capacity(opening_count);
+        for _ in 0..opening_count {
+            let sibling_count = decoder.count(16, MAX_DEPTH as usize)?;
+            let mut siblings = Vec::with_capacity(sibling_count);
+            for _ in 0..sibling_count {
+                siblings.push(decoder.array()?);
+            }
+            openings.push(VcOpening {
+                siblings,
+                hidden_com: decoder.array()?,
+            });
+        }
+        decoder.finish()?;
+        Ok(Self {
+            salt,
+            coms,
+            corrections,
+            d,
+            u_tilde,
+            v_tilde,
+            qs_coefficients,
+            openings,
+        })
+    }
+}
+
+fn put_len(out: &mut Vec<u8>, len: usize) {
+    let len = u32::try_from(len).expect("in-memory proof component exceeds wire format");
+    out.extend_from_slice(&len.to_le_bytes());
+}
+
+fn put_bits(out: &mut Vec<u8>, bits: &BitVec) {
+    let len = u64::try_from(bits.len()).expect("bit vector length exceeds wire format");
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(bits.as_bytes());
+}
+
+struct ProofDecoder<'a> {
+    input: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> ProofDecoder<'a> {
+    fn new(input: &'a [u8]) -> Self {
+        Self { input, offset: 0 }
+    }
+
+    fn remaining(&self) -> usize {
+        self.input.len() - self.offset
+    }
+
+    fn take(&mut self, len: usize) -> Result<&'a [u8], ProofDecodeError> {
+        let end = self
+            .offset
+            .checked_add(len)
+            .filter(|end| *end <= self.input.len())
+            .ok_or(ProofDecodeError::InvalidEncoding)?;
+        let out = &self.input[self.offset..end];
+        self.offset = end;
+        Ok(out)
+    }
+
+    fn array<const N: usize>(&mut self) -> Result<[u8; N], ProofDecodeError> {
+        self.take(N)?
+            .try_into()
+            .map_err(|_| ProofDecodeError::InvalidEncoding)
+    }
+
+    fn expect(&mut self, expected: &[u8]) -> Result<(), ProofDecodeError> {
+        if self.take(expected.len())? == expected {
+            Ok(())
+        } else {
+            Err(ProofDecodeError::InvalidEncoding)
+        }
+    }
+
+    fn u32(&mut self) -> Result<u32, ProofDecodeError> {
+        Ok(u32::from_le_bytes(self.array()?))
+    }
+
+    fn u64(&mut self) -> Result<u64, ProofDecodeError> {
+        Ok(u64::from_le_bytes(self.array()?))
+    }
+
+    fn count(
+        &mut self,
+        minimum_item_bytes: usize,
+        absolute_maximum: usize,
+    ) -> Result<usize, ProofDecodeError> {
+        let count = usize::try_from(self.u32()?).map_err(|_| ProofDecodeError::InvalidEncoding)?;
+        let maximum = self.remaining() / minimum_item_bytes.max(1);
+        if count > maximum || count > absolute_maximum {
+            return Err(ProofDecodeError::InvalidEncoding);
+        }
+        Ok(count)
+    }
+
+    fn bits(&mut self) -> Result<BitVec, ProofDecodeError> {
+        let bit_len =
+            usize::try_from(self.u64()?).map_err(|_| ProofDecodeError::InvalidEncoding)?;
+        let byte_len = bit_len
+            .checked_add(7)
+            .ok_or(ProofDecodeError::InvalidEncoding)?
+            / 8;
+        let bytes = self.take(byte_len)?.to_vec();
+        BitVec::from_bytes(bytes, bit_len).ok_or(ProofDecodeError::InvalidEncoding)
+    }
+
+    fn finish(self) -> Result<(), ProofDecodeError> {
+        if self.offset == self.input.len() {
+            Ok(())
+        } else {
+            Err(ProofDecodeError::InvalidEncoding)
+        }
+    }
 }
 
 /// Read one field element from a challenge stream.
@@ -79,6 +332,7 @@ fn absorb_prologue(
     public_input: &[u8],
     params: &Params,
     num_witness_bits: usize,
+    max_degree: usize,
     salt: &[u8; 16],
     coms: &[VcCommitment],
     corrections: &[BitVec],
@@ -89,6 +343,7 @@ fn absorb_prologue(
     dims.extend_from_slice(&(params.tau as u64).to_le_bytes());
     dims.extend_from_slice(&(params.k as u64).to_le_bytes());
     dims.extend_from_slice(&(num_witness_bits as u64).to_le_bytes());
+    dims.extend_from_slice(&(max_degree as u64).to_le_bytes());
     tr.absorb(b"dims", &dims);
     tr.absorb(b"salt", salt);
     for com in coms {
@@ -100,65 +355,161 @@ fn absorb_prologue(
     tr.absorb(b"witness-d", d.as_bytes());
 }
 
-/// Compute the consistency-check hashes over coordinates `[0, ℓ+λ)` with
-/// XOF-derived coefficients, plus the `X^b`-combined mask coordinates.
+/// Key for the wide linear universal hash used by the VOLE consistency
+/// check. For input `(x₀, x₁)` with `x₁` exactly 128 bits, the hash is
 ///
-/// Returns the masked `(hash of u, hash of tags/keys)` pair — on the prover
-/// side pass `Some(u)` to get both; on the verifier side pass `None` and use
-/// the returned "tag" slot as the key-side combination.
-fn consistency_combine(
-    alpha: &mut impl XofReader,
-    l: usize,
-    lambda: usize,
-    u: Option<&BitVec>,
-    elems: &[GF2p128],
-) -> (GF2p128, GF2p128) {
-    let mut u_acc = GF2p128::ZERO;
-    let mut e_acc = GF2p128::ZERO;
-    for (t, elem) in elems.iter().enumerate().take(l + lambda) {
-        let a = next_elem(alpha);
-        if let Some(u) = u
-            && u.get(t)
-        {
-            u_acc += a;
-        }
-        e_acc += a * *elem;
-    }
-    // Mask coordinates [ℓ+λ, ℓ+2λ) enter with fixed coefficients X^b.
-    for b in 0..lambda {
-        let t = l + lambda + b;
-        let xb = GF2p128::new(1u128 << b);
-        if let Some(u) = u
-            && u.get(t)
-        {
-            u_acc += xb;
-        }
-        e_acc += xb * elems[t];
-    }
-    (u_acc, e_acc)
+/// `r₀·P_s(x₀) + r₁·P_t(x₀) + x₁`.
+///
+/// `P_s` and `P_t` parse 128-bit chunks of `x₀` as coefficients and
+/// evaluate the resulting polynomial at independent random field points.
+/// The two evaluations make the probability that a nonzero input reaches
+/// `(0,0)` negligible; conditioned on either being nonzero, the random
+/// linear combination is uniform in `F₂¹²⁸`. The final identity block makes
+/// the hash perfectly hiding when `x₁` is uniform.
+#[derive(Clone, Copy)]
+struct WideHashKey {
+    r0: GF2p128,
+    r1: GF2p128,
+    s: GF2p128,
+    t: GF2p128,
 }
 
-/// Combine the QuickSilver mask coordinates `[ℓ, ℓ+λ)` into a single
+impl WideHashKey {
+    fn draw(reader: &mut impl XofReader) -> Self {
+        Self {
+            r0: next_elem(reader),
+            r1: next_elem(reader),
+            s: next_elem(reader),
+            t: next_elem(reader),
+        }
+    }
+}
+
+/// Evaluate the wide hash on one bit-vector column.
+fn wide_hash_bits(key: WideHashKey, input: &BitVec) -> GF2p128 {
+    debug_assert!(input.len() >= 128);
+    let x0_len = input.len() - 128;
+    let mut hs = GF2p128::ZERO;
+    let mut ht = GF2p128::ZERO;
+    for base in (0..x0_len).step_by(128) {
+        let take = (x0_len - base).min(128);
+        let mut chunk = 0u128;
+        for bit in 0..take {
+            chunk |= (input.get(base + bit) as u128) << bit;
+        }
+        let chunk = GF2p128::new(chunk);
+        hs = hs * key.s + chunk;
+        ht = ht * key.t + chunk;
+    }
+    let mut mask = 0u128;
+    for bit in 0..128 {
+        mask |= (input.get(x0_len + bit) as u128) << bit;
+    }
+    key.r0 * hs + key.r1 * ht + GF2p128::new(mask)
+}
+
+/// Apply the same wide hash to every column of an `input.len() × 128`
+/// bit matrix whose rows are packed as field elements. The result uses the
+/// same row-packed representation and therefore has exactly 128 elements.
+fn wide_hash_rows(key: WideHashKey, input: &[GF2p128]) -> Vec<GF2p128> {
+    debug_assert!(input.len() >= 128);
+    let x0_len = input.len() - 128;
+    let mut hs = [GF2p128::ZERO; 128];
+    let mut ht = [GF2p128::ZERO; 128];
+
+    for base in (0..x0_len).step_by(128) {
+        let take = (x0_len - base).min(128);
+        let mut columns = [0u128; 128];
+        for row in 0..take {
+            let bits = input[base + row].to_u128();
+            for (column, value) in columns.iter_mut().enumerate() {
+                *value |= ((bits >> column) & 1) << row;
+            }
+        }
+        for column in 0..128 {
+            let chunk = GF2p128::new(columns[column]);
+            hs[column] = hs[column] * key.s + chunk;
+            ht[column] = ht[column] * key.t + chunk;
+        }
+    }
+
+    let mixed: [GF2p128; 128] =
+        core::array::from_fn(|column| key.r0 * hs[column] + key.r1 * ht[column]);
+    let mut out = vec![GF2p128::ZERO; 128];
+    for (row, packed) in out.iter_mut().enumerate() {
+        let mut bits = 0u128;
+        for (column, value) in mixed.iter().enumerate() {
+            bits |= ((value.to_u128() >> row) & 1) << column;
+        }
+        *packed = GF2p128::new(bits) + input[x0_len + row];
+    }
+    out
+}
+
+/// Combine each of the QuickSilver mask coordinate groups into one
 /// `F₂^λ`-valued VOLE: value `Σ X^b·u_b`, tag/key `Σ X^b·elem_b`.
-fn qs_mask_combine(
+fn qs_mask_groups(
     l: usize,
     lambda: usize,
+    groups: usize,
     u: Option<&BitVec>,
     elems: &[GF2p128],
-) -> (GF2p128, GF2p128) {
-    let mut u_acc = GF2p128::ZERO;
-    let mut e_acc = GF2p128::ZERO;
-    for b in 0..lambda {
-        let t = l + b;
-        let xb = GF2p128::new(1u128 << b);
-        if let Some(u) = u
-            && u.get(t)
-        {
-            u_acc += xb;
-        }
-        e_acc += xb * elems[t];
+) -> Vec<(GF2p128, GF2p128)> {
+    (0..groups)
+        .map(|group| {
+            let mut u_acc = GF2p128::ZERO;
+            let mut e_acc = GF2p128::ZERO;
+            for b in 0..lambda {
+                let coordinate = l + group * lambda + b;
+                let xb = GF2p128::new(1u128 << b);
+                if let Some(u) = u
+                    && u.get(coordinate)
+                {
+                    u_acc += xb;
+                }
+                e_acc += xb * elems[coordinate];
+            }
+            (u_acc, e_acc)
+        })
+        .collect()
+}
+
+fn align_and_accumulate(output: &mut [GF2p128], coefficients: &[GF2p128], weight: GF2p128) {
+    let shift = output.len() - coefficients.len();
+    for (index, coefficient) in coefficients.iter().enumerate() {
+        output[shift + index] += weight * *coefficient;
     }
-    (u_acc, e_acc)
+}
+
+fn evaluate_polynomial(coefficients: &[GF2p128], point: GF2p128) -> GF2p128 {
+    coefficients
+        .iter()
+        .rev()
+        .fold(GF2p128::ZERO, |acc, coefficient| acc * point + *coefficient)
+}
+
+fn constraint_degree(constraint: &VerifierConstraint) -> usize {
+    match constraint {
+        VerifierConstraint::Simple(_) | VerifierConstraint::System(_) => 2,
+        VerifierConstraint::Polynomial(_, degree) => *degree,
+    }
+}
+
+fn verifier_constraint_evaluation(
+    constraint: &VerifierConstraint,
+    chi: &mut impl XofReader,
+    delta: GF2p128,
+) -> GF2p128 {
+    match constraint {
+        VerifierConstraint::Simple(value) => *value,
+        VerifierConstraint::System(system) => {
+            let phis: Vec<GF2p128> = (0..system.num_equations())
+                .map(|_| next_elem(chi))
+                .collect();
+            system.fold(&phis, delta)
+        }
+        VerifierConstraint::Polynomial(value, _) => *value,
+    }
 }
 
 /// Produce a proof that `circuit` is satisfied by `witness`.
@@ -195,13 +546,17 @@ pub(crate) fn prove_impl<C: Circuit>(
     let mut counter = CountingBackend::default();
     circuit.build(&mut counter)?;
     let l = counter.witness_bits;
+    let max_degree = counter.max_degree.max(2);
     if l == 0 {
+        return Err(VoleithError::InvalidParameters);
+    }
+    if max_degree > MAX_DEGREE {
         return Err(VoleithError::InvalidParameters);
     }
     if witness.len() != l {
         return Err(VoleithError::WitnessMismatch);
     }
-    let l_hat = l + 2 * lambda;
+    let l_hat = l + max_degree * lambda;
 
     // Commit the VOLE correlations.
     let mut salt = [0u8; 16];
@@ -234,6 +589,7 @@ pub(crate) fn prove_impl<C: Circuit>(
         public_input,
         params,
         l,
+        max_degree,
         &salt,
         &vole.coms,
         &vole.corrections,
@@ -242,39 +598,54 @@ pub(crate) fn prove_impl<C: Circuit>(
 
     // Consistency check.
     let mut alpha = tr.challenge_xof(b"alpha");
-    let (u_tilde, v_tilde) = consistency_combine(&mut alpha, l, lambda, Some(&vole.u), &vole.tags);
-    let mut consist = Vec::with_capacity(32);
+    let wide_key = WideHashKey::draw(&mut alpha);
+    let u_tilde = wide_hash_bits(wide_key, &vole.u);
+    let v_tilde = wide_hash_rows(wide_key, &vole.tags);
+    let mut consist = Vec::with_capacity(16 + 16 * lambda);
     consist.extend_from_slice(&u_tilde.to_bytes());
-    consist.extend_from_slice(&v_tilde.to_bytes());
+    for row in &v_tilde {
+        consist.extend_from_slice(&row.to_bytes());
+    }
     tr.absorb(b"consistency", &consist);
 
     // QuickSilver batch. Quadratic systems draw their fold coefficients
     // from the same challenge stream, in emission order, before their χ.
     let mut chi = tr.challenge_xof(b"chi");
-    let (qs_mask_u, qs_mask_v) = qs_mask_combine(l, lambda, Some(&vole.u), &vole.tags);
-    let mut qs_w = qs_mask_v;
-    let mut qs_u = qs_mask_u;
+    let masks = qs_mask_groups(l, lambda, max_degree - 1, Some(&vole.u), &vole.tags);
+    let mut qs_coefficients = vec![GF2p128::ZERO; max_degree];
+    for (index, (mask_value, mask_tag)) in masks.into_iter().enumerate() {
+        qs_coefficients[index] += mask_tag;
+        qs_coefficients[index + 1] += mask_value;
+    }
     for constraint in &backend.constraints {
-        let (a0, a1) = match constraint {
-            ProverConstraint::Simple(a0, a1) => (*a0, *a1),
+        let coefficients = match constraint {
+            ProverConstraint::Simple(a0, a1) => vec![*a0, *a1, GF2p128::ZERO],
             ProverConstraint::System(sys) => {
                 let phis: Vec<GF2p128> = (0..sys.num_equations())
                     .map(|_| next_elem(&mut chi))
                     .collect();
-                let (a0, a1, sat) = sys.fold(&phis);
-                if !sat {
+                let (a0, a1, error) = sys.fold(&phis);
+                if enforce_satisfied && error != GF2p128::ZERO {
                     return Err(VoleithError::Unsatisfiable);
                 }
-                (a0, a1)
+                vec![a0, a1, error]
             }
+            ProverConstraint::Polynomial(coefficients) => coefficients.clone(),
         };
         let x = next_elem(&mut chi);
-        qs_w += x * a0;
-        qs_u += x * a1;
+        // The leading coefficient is the asserted circuit value. The prover
+        // claims it is zero by omitting it; the verifier's evaluation retains
+        // it and therefore detects a false claim at the final random point.
+        align_and_accumulate(
+            &mut qs_coefficients,
+            &coefficients[..coefficients.len() - 1],
+            x,
+        );
     }
-    let mut qs_bytes = Vec::with_capacity(32);
-    qs_bytes.extend_from_slice(&qs_u.to_bytes());
-    qs_bytes.extend_from_slice(&qs_w.to_bytes());
+    let mut qs_bytes = Vec::with_capacity(16 * max_degree);
+    for coefficient in &qs_coefficients {
+        qs_bytes.extend_from_slice(&coefficient.to_bytes());
+    }
     tr.absorb(b"quicksilver", &qs_bytes);
 
     // Final challenge and openings.
@@ -292,8 +663,7 @@ pub(crate) fn prove_impl<C: Circuit>(
         d,
         u_tilde,
         v_tilde,
-        qs_u,
-        qs_w,
+        qs_coefficients,
         openings,
     })
 }
@@ -312,14 +682,20 @@ pub fn verify<C: Circuit>(
     let mut counter = CountingBackend::default();
     circuit.build(&mut counter)?;
     let l = counter.witness_bits;
+    let max_degree = counter.max_degree.max(2);
     if l == 0 {
         return Err(VoleithError::InvalidParameters);
     }
-    let l_hat = l + 2 * lambda;
+    if max_degree > MAX_DEGREE {
+        return Err(VoleithError::InvalidParameters);
+    }
+    let l_hat = l + max_degree * lambda;
     if proof.d.len() != l
         || proof.coms.len() != params.tau
         || proof.corrections.len() != params.tau - 1
         || proof.openings.len() != params.tau
+        || proof.v_tilde.len() != lambda
+        || proof.qs_coefficients.len() != max_degree
         || proof.corrections.iter().any(|c| c.len() != l_hat)
     {
         return Err(VoleithError::InvalidProof);
@@ -332,20 +708,25 @@ pub fn verify<C: Circuit>(
         public_input,
         params,
         l,
+        max_degree,
         &proof.salt,
         &proof.coms,
         &proof.corrections,
         &proof.d,
     );
     let mut alpha = tr.challenge_xof(b"alpha");
-    let mut consist = Vec::with_capacity(32);
+    let wide_key = WideHashKey::draw(&mut alpha);
+    let mut consist = Vec::with_capacity(16 + 16 * lambda);
     consist.extend_from_slice(&proof.u_tilde.to_bytes());
-    consist.extend_from_slice(&proof.v_tilde.to_bytes());
+    for row in &proof.v_tilde {
+        consist.extend_from_slice(&row.to_bytes());
+    }
     tr.absorb(b"consistency", &consist);
     let mut chi = tr.challenge_xof(b"chi");
-    let mut qs_bytes = Vec::with_capacity(32);
-    qs_bytes.extend_from_slice(&proof.qs_u.to_bytes());
-    qs_bytes.extend_from_slice(&proof.qs_w.to_bytes());
+    let mut qs_bytes = Vec::with_capacity(16 * max_degree);
+    for coefficient in &proof.qs_coefficients {
+        qs_bytes.extend_from_slice(&coefficient.to_bytes());
+    }
     tr.absorb(b"quicksilver", &qs_bytes);
     let mut chall3 = [0u8; 16];
     tr.challenge_bytes(b"delta", &mut chall3);
@@ -363,10 +744,20 @@ pub fn verify<C: Circuit>(
     )
     .map_err(|_| VoleithError::InvalidProof)?;
 
-    // Consistency check: Σ αₜ·Kₜ + K_mask == ṽ + ũ·Δ.
-    let (_, key_combined) = consistency_combine(&mut alpha, l, lambda, None, &keys);
-    if key_combined != proof.v_tilde + proof.u_tilde * delta {
-        return Err(VoleithError::InvalidProof);
+    // Wide consistency check, row by row: Q̃ = Ṽ + ũ·Δ. Applying
+    // one 128-bit universal hash column-wise prevents a prover from isolating
+    // a malformed correction in a single k-bit challenge chunk.
+    let key_tilde = wide_hash_rows(wide_key, &keys);
+    let u_bits = proof.u_tilde.to_u128();
+    for (row, key_row) in key_tilde.iter().enumerate().take(lambda) {
+        let expected = if (u_bits >> row) & 1 == 1 {
+            proof.v_tilde[row] + delta
+        } else {
+            proof.v_tilde[row]
+        };
+        if *key_row != expected {
+            return Err(VoleithError::InvalidProof);
+        }
     }
 
     // Witness-stage keys: K'_t = K_t + d_t·Δ.
@@ -384,23 +775,19 @@ pub fn verify<C: Circuit>(
         return Err(VoleithError::WitnessMismatch);
     }
 
-    // QuickSilver check: Σ χᵢ·Bᵢ + Q* == W + U·Δ.
-    let (_, qs_mask_key) = qs_mask_combine(l, lambda, None, &keys);
-    let mut acc = qs_mask_key;
-    for check in &backend.checks {
-        let b = match check {
-            VerifierConstraint::Simple(b) => *b,
-            VerifierConstraint::System(sys) => {
-                let phis: Vec<GF2p128> = (0..sys.num_equations())
-                    .map(|_| next_elem(&mut chi))
-                    .collect();
-                sys.fold(&phis, delta)
-            }
-        };
-        let x = next_elem(&mut chi);
-        acc += x * b;
+    // Degree-d QuickSilver check. Mask group j contributes `Δʲ·Kⱼ`,
+    // pairing its tag with coefficient j and its value with j+1.
+    let mask_keys = qs_mask_groups(l, lambda, max_degree - 1, None, &keys);
+    let mut acc = GF2p128::ZERO;
+    for (degree, (_, key)) in mask_keys.into_iter().enumerate() {
+        acc += key * delta.pow(degree as u128);
     }
-    if acc != proof.qs_w + proof.qs_u * delta {
+    for check in &backend.checks {
+        let value = verifier_constraint_evaluation(check, &mut chi, delta);
+        let x = next_elem(&mut chi);
+        acc += x * value * delta.pow((max_degree - constraint_degree(check)) as u128);
+    }
+    if acc != evaluate_polynomial(&proof.qs_coefficients, delta) {
         return Err(VoleithError::InvalidProof);
     }
 
@@ -411,7 +798,7 @@ pub fn verify<C: Circuit>(
 mod soundness_tests {
     use super::*;
     use crate::backend::Backend;
-    use crate::vole::PARAMS_128;
+    use crate::vole::PARAMS_128_FAST as PARAMS_128;
     use rand::SeedableRng;
     use rand::rngs::StdRng;
 
@@ -439,7 +826,7 @@ mod soundness_tests {
 
         // Malicious proof over a false statement (bit = 1) must be rejected
         // by the verifier, across many transcripts (no lucky Δ).
-        for seed in 0..40u64 {
+        for seed in 0..8u64 {
             let mut rng = StdRng::seed_from_u64(1000 + seed);
             let bad =
                 prove_impl(&PARAMS_128, b"az", &AssertBitZero, &[true], &mut rng, false).unwrap();
@@ -449,5 +836,105 @@ mod soundness_tests {
                 "false assert_zero accepted at seed {seed}"
             );
         }
+    }
+
+    /// Exercise the exact degree used by the four-round Keccak checkpoints.
+    struct DegreeSixteenZero;
+
+    impl Circuit for DegreeSixteenZero {
+        fn build<B: Backend>(&self, backend: &mut B) -> Result<(), VoleithError> {
+            let bit = backend.witness_bit()?;
+            let mut expression = backend.wire_expr(&bit);
+            for _ in 0..4 {
+                expression = backend.expr_mul(&expression, &expression);
+            }
+            backend.assert_expr_zero(&expression);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn false_degree_sixteen_assertion_is_rejected() {
+        let mut rng = StdRng::seed_from_u64(200);
+        let ok = prove_impl(
+            &PARAMS_128,
+            b"degree-sixteen",
+            &DegreeSixteenZero,
+            &[false],
+            &mut rng,
+            true,
+        )
+        .unwrap();
+        assert_eq!(ok.qs_coefficients.len(), 16);
+        verify(&PARAMS_128, b"degree-sixteen", &DegreeSixteenZero, &ok).unwrap();
+
+        for seed in 0..8u64 {
+            let mut rng = StdRng::seed_from_u64(2000 + seed);
+            let bad = prove_impl(
+                &PARAMS_128,
+                b"degree-sixteen",
+                &DegreeSixteenZero,
+                &[true],
+                &mut rng,
+                false,
+            )
+            .unwrap();
+            assert_eq!(
+                verify(&PARAMS_128, b"degree-sixteen", &DegreeSixteenZero, &bad,),
+                Err(VoleithError::InvalidProof),
+                "false degree-16 assertion accepted at seed {seed}"
+            );
+        }
+    }
+
+    struct DegreeDZero(usize);
+
+    impl Circuit for DegreeDZero {
+        fn build<B: Backend>(&self, backend: &mut B) -> Result<(), VoleithError> {
+            let bit = backend.witness_bit()?;
+            let base = backend.wire_expr(&bit);
+            let mut expression = base.clone();
+            for _ in 1..self.0 {
+                expression = backend.expr_mul(&expression, &base);
+            }
+            backend.assert_expr_zero(&expression);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn every_supported_polynomial_degree_rejects_a_false_statement() {
+        for degree in 1..=MAX_DEGREE {
+            let circuit = DegreeDZero(degree);
+            let mut rng = StdRng::seed_from_u64(0xD3_0000 + degree as u64);
+            let bad = prove_impl(
+                &PARAMS_128,
+                b"all-degrees",
+                &circuit,
+                &[true],
+                &mut rng,
+                false,
+            )
+            .unwrap();
+            assert_eq!(
+                verify(&PARAMS_128, b"all-degrees", &circuit, &bad),
+                Err(VoleithError::InvalidProof),
+                "false degree-{degree} assertion accepted"
+            );
+        }
+
+        let mut rng = StdRng::seed_from_u64(0xD3_0011);
+        assert_eq!(
+            prove_impl(
+                &PARAMS_128,
+                b"degree-too-large",
+                &DegreeDZero(MAX_DEGREE + 1),
+                &[false],
+                &mut rng,
+                true,
+            )
+            .unwrap_err(),
+            VoleithError::InvalidParameters
+        );
     }
 }

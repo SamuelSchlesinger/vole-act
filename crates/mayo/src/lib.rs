@@ -1,7 +1,8 @@
 //! The MAYO trapdoor function over GF(16).
 //!
-//! MAYO (Beullens; NIST PQ DSA round-2 candidate) is a "whipped"
-//! Oil-and-Vinegar trapdoor: the public key is a multivariate quadratic map
+//! MAYO (Beullens; a NIST additional-signature candidate, with this crate
+//! pinned to its round-2 specification) is a "whipped" Oil-and-Vinegar
+//! trapdoor: the public key is a multivariate quadratic map
 //! `P : F₁₆ⁿ → F₁₆^m` vanishing on a secret o-dimensional oil space, and the
 //! whipped map
 //!

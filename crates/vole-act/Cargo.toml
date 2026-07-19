@@ -12,9 +12,15 @@ voleith = { workspace = true }
 mayo = { workspace = true }
 rand_core = { workspace = true }
 sha3 = { workspace = true }
+zeroize = { workspace = true }
 
 [dev-dependencies]
+criterion = "0.5"
 rand = "0.8"
+
+[[bench]]
+name = "protocol"
+harness = false
 
 [lints]
 workspace = true

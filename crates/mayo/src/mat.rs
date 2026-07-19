@@ -3,6 +3,7 @@
 
 use binary_fields::{BinaryField, GF16};
 use rand_core::CryptoRngCore;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// A dense row-major matrix over `GF(16)`.
 #[derive(Clone, PartialEq, Eq)]
@@ -12,7 +13,25 @@ pub struct Mat {
     data: Vec<GF16>,
 }
 
+impl Zeroize for Mat {
+    fn zeroize(&mut self) {
+        self.data.zeroize();
+    }
+}
+
+impl Drop for Mat {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for Mat {}
+
 impl Mat {
+    pub(crate) fn from_data(rows: usize, cols: usize, data: Vec<GF16>) -> Option<Self> {
+        (data.len() == rows.checked_mul(cols)?).then_some(Self { rows, cols, data })
+    }
+
     /// A zero matrix.
     #[must_use]
     pub fn zero(rows: usize, cols: usize) -> Self {
@@ -64,9 +83,6 @@ impl Mat {
         for r in 0..self.rows {
             for i in 0..self.cols {
                 let a = self[(r, i)];
-                if a == GF16::ZERO {
-                    continue;
-                }
                 for c in 0..rhs.cols {
                     out[(r, c)] += a * rhs[(i, c)];
                 }
@@ -119,14 +135,22 @@ impl Mat {
         assert_eq!(v.len(), self.rows);
         let mut out = vec![GF16::ZERO; self.cols];
         for (r, &vr) in v.iter().enumerate() {
-            if vr == GF16::ZERO {
-                continue;
-            }
             for c in 0..self.cols {
                 out[c] += vr * self[(r, c)];
             }
         }
         out
+    }
+
+    /// The quadratic form `vᵀ · M · v`.
+    #[must_use]
+    pub fn quad_form(&self, v: &[GF16]) -> GF16 {
+        assert_eq!(self.rows, self.cols);
+        assert_eq!(v.len(), self.rows);
+        let mv = self.mul_vec(v);
+        v.iter()
+            .zip(mv.iter())
+            .fold(GF16::ZERO, |acc, (a, b)| acc + *a * *b)
     }
 
     /// `M·v`: matrix times column vector, as a vector of length `rows`.
@@ -165,9 +189,12 @@ impl core::fmt::Debug for Mat {
 }
 
 /// Solve `A·x = y` for a uniformly random solution, per spec Algorithm 2
-/// (`SampleSolution`): randomize with `r`, reduce `(A|y)` to echelon form,
-/// fail if `A` has rank < rows, then back-substitute.
+/// (`SampleSolution`).
 ///
+/// Elimination uses a fixed public loop schedule, scans every possible pivot
+/// row, and applies masked row selection. Pivot positions never become array
+/// indices or branch conditions. The final full-rank result is allowed to
+/// select success versus retry, as in the official MAYO implementation.
 /// Returns `None` when `A` does not have full row rank.
 #[must_use]
 pub fn sample_solution(a: &Mat, y: &[GF16], r: &[GF16]) -> Option<Vec<GF16>> {
@@ -177,69 +204,119 @@ pub fn sample_solution(a: &Mat, y: &[GF16], r: &[GF16]) -> Option<Vec<GF16>> {
     assert_eq!(r.len(), cols);
 
     // x ← r; y' ← y − A·r.
-    let ar = a.mul_vec(r);
+    let mut ar = a.mul_vec(r);
     let mut aug = Mat::zero(m, cols + 1);
-    for rr in 0..m {
-        for cc in 0..cols {
-            aug[(rr, cc)] = a[(rr, cc)];
+    for row in 0..m {
+        for column in 0..cols {
+            aug[(row, column)] = a[(row, column)];
         }
-        aug[(rr, cols)] = y[rr] + ar[rr];
+        aug[(row, cols)] = y[row] + ar[row];
     }
 
-    // Echelon form with leading ones (spec Algorithm 1).
+    // Mask helpers return one-bit values. Matrix dimensions are public and
+    // far below the top bit of usize, so wrapping-subtraction comparison is
+    // unambiguous on every supported target.
+    let ct_is_zero =
+        |value: usize| -> u8 { (((value | value.wrapping_neg()) >> (usize::BITS - 1)) ^ 1) as u8 };
+    let ct_eq = |left: usize, right: usize| -> u8 { ct_is_zero(left ^ right) };
+    let ct_lt =
+        |left: usize, right: usize| -> u8 { (left.wrapping_sub(right) >> (usize::BITS - 1)) as u8 };
+    let gf_nonzero = |value: GF16| -> u8 {
+        let value = value.to_u8() as usize;
+        1 ^ ct_is_zero(value)
+    };
+
+    // Fixed-schedule Gauss-Jordan elimination. `pivot_row` and the arrays
+    // derived from it are secret data, but are used only through full scans.
     let mut pivot_row = 0;
-    let mut pivot_col = 0;
-    let mut pivots = Vec::with_capacity(m);
-    while pivot_row < m && pivot_col < cols + 1 {
-        let Some(next) = (pivot_row..m).find(|&rr| aug[(rr, pivot_col)] != GF16::ZERO) else {
-            pivot_col += 1;
-            continue;
-        };
-        // Swap rows.
-        if next != pivot_row {
-            for cc in 0..=cols {
-                let tmp = aug[(pivot_row, cc)];
-                aug[(pivot_row, cc)] = aug[(next, cc)];
-                aug[(next, cc)] = tmp;
+    let mut pivot_rows = vec![0usize; cols];
+    let mut pivot_columns = vec![0u8; cols];
+    let mut selected = vec![GF16::ZERO; cols + 1];
+    let mut normalized = vec![GF16::ZERO; cols + 1];
+
+    for pivot_column in 0..cols {
+        selected.fill(GF16::ZERO);
+        let mut found = 0u8;
+        for row in 0..m {
+            let at_or_below = 1 ^ ct_lt(row, pivot_row);
+            let is_target = ct_eq(row, pivot_row);
+            let take_lower =
+                at_or_below & (is_target ^ 1) & gf_nonzero(aug[(row, pivot_column)]) & (found ^ 1);
+            // Always include the current target row. If its pivot is zero,
+            // XOR in the first usable lower row. Subsequent elimination then
+            // moves the old target row into that source row, preserving rank
+            // without a secret-indexed swap.
+            let include = is_target | take_lower;
+            let mask = 0u8.wrapping_sub(include);
+            for column in 0..=cols {
+                selected[column] += GF16::new(aug[(row, column)].to_u8() & mask);
+            }
+            found |= at_or_below & gf_nonzero(aug[(row, pivot_column)]);
+        }
+
+        let inverse = selected[pivot_column].inv();
+        for column in 0..=cols {
+            normalized[column] = inverse * selected[column];
+        }
+
+        pivot_rows[pivot_column] = pivot_row;
+        pivot_columns[pivot_column] = found;
+
+        // Put the normalized row at secret index `pivot_row` via a full scan.
+        for row in 0..m {
+            let write = found & ct_eq(row, pivot_row);
+            let write_mask = 0u8.wrapping_sub(write);
+            let keep_mask = !write_mask;
+            for column in 0..=cols {
+                let old = aug[(row, column)].to_u8();
+                let new = normalized[column].to_u8();
+                aug[(row, column)] = GF16::new((old & keep_mask) | (new & write_mask));
             }
         }
-        // Normalize the pivot row.
-        let inv = aug[(pivot_row, pivot_col)].inv();
-        for cc in 0..=cols {
-            aug[(pivot_row, cc)] = inv * aug[(pivot_row, cc)];
-        }
-        // Eliminate below.
-        for rr in (pivot_row + 1)..m {
-            let f = aug[(rr, pivot_col)];
-            if f != GF16::ZERO {
-                for cc in 0..=cols {
-                    let sub = f * aug[(pivot_row, cc)];
-                    aug[(rr, cc)] += sub;
-                }
+
+        // Eliminate this pivot column from every other row. All row and
+        // column accesses are public; only field values are masked.
+        for row in 0..m {
+            let eliminate = found & (1 ^ ct_eq(row, pivot_row));
+            let mask = 0u8.wrapping_sub(eliminate);
+            let factor = GF16::new(aug[(row, pivot_column)].to_u8() & mask);
+            for column in 0..=cols {
+                aug[(row, column)] += factor * normalized[column];
             }
         }
-        pivots.push(pivot_col);
-        pivot_row += 1;
-        pivot_col += 1;
+        pivot_row += found as usize;
     }
 
-    // Full row rank means every row got a pivot inside A (not the y column).
-    if pivot_row < m || pivots.iter().any(|&c| c >= cols) {
+    // Revealing whether this sample needs a retry is permitted by MAYO.
+    if pivot_row != m {
+        ar.zeroize();
+        aug.zeroize();
+        pivot_rows.zeroize();
+        pivot_columns.zeroize();
+        selected.zeroize();
+        normalized.zeroize();
         return None;
     }
 
-    // Back-substitution: x_c ← x_c + y_r; y ← y − y_r·A[:,c].
+    // Free correction variables are zero. For every pivot column, scan all
+    // rows to select the final RREF right-hand side without indexing by its
+    // secret pivot row.
     let mut x: Vec<GF16> = r.to_vec();
-    let mut rhs: Vec<GF16> = (0..m).map(|rr| aug[(rr, cols)]).collect();
-    for rr in (0..m).rev() {
-        let c = pivots[rr];
-        let yr = rhs[rr];
-        x[c] += yr;
-        // Update earlier rows' rhs to account for x_c's new value.
-        for up in 0..rr {
-            rhs[up] += yr * aug[(up, c)];
+    for column in 0..cols {
+        let mut correction = 0u8;
+        for row in 0..m {
+            let mask = 0u8.wrapping_sub(ct_eq(row, pivot_rows[column]));
+            correction ^= aug[(row, cols)].to_u8() & mask;
         }
+        correction &= 0u8.wrapping_sub(pivot_columns[column]);
+        x[column] += GF16::new(correction);
     }
+    ar.zeroize();
+    aug.zeroize();
+    pivot_rows.zeroize();
+    pivot_columns.zeroize();
+    selected.zeroize();
+    normalized.zeroize();
     Some(x)
 }
 
@@ -270,6 +347,7 @@ mod tests {
     #[test]
     fn sample_solution_solves() {
         let mut rng = StdRng::seed_from_u64(2);
+        let mut successes = 0;
         for trial in 0..50 {
             let m = 6;
             let cols = 10;
@@ -278,8 +356,10 @@ mod tests {
             let r: Vec<GF16> = (0..cols).map(|_| GF16::random(&mut rng)).collect();
             if let Some(x) = sample_solution(&a, &y, &r) {
                 assert_eq!(a.mul_vec(&x), y, "trial {trial}: A·x must equal y");
+                successes += 1;
             }
         }
+        assert!(successes >= 48, "unexpected full-rank rate: {successes}/50");
     }
 
     #[test]

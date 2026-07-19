@@ -5,6 +5,7 @@ use core::fmt;
 use core::iter::{Product, Sum};
 use core::ops::{Add, AddAssign, Mul, MulAssign, Sub, SubAssign};
 use rand_core::CryptoRngCore;
+use zeroize::Zeroize;
 
 /// An element of `GF(16) = F₂[x]/(x⁴ + x + 1)`.
 ///
@@ -13,6 +14,12 @@ use rand_core::CryptoRngCore;
 /// zero (an invariant maintained by every constructor).
 #[derive(Clone, Copy, PartialEq, Eq, Default, Hash, PartialOrd, Ord)]
 pub struct GF16(u8);
+
+impl Zeroize for GF16 {
+    fn zeroize(&mut self) {
+        self.0.zeroize();
+    }
+}
 
 impl GF16 {
     /// The reduction polynomial `x⁴ + x + 1` as a bit pattern.

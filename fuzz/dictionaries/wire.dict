@@ -1,0 +1,6 @@
+# Canonical format prefixes. These make raw-input fuzzing reach the guarded
+# decoders without depending entirely on valid-artifact mutation targets.
+act_magic="VACT\x01"
+proof_magic="VITH\x01"
+mayo_public_magic="MAYOPK\x01"
+mayo_secret_magic="MAYOSK\x01"

@@ -1,0 +1,58 @@
+[package]
+name = "vole-act-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+binary-fields = { path = "../crates/binary-fields" }
+libfuzzer-sys = "0.4"
+mayo = { path = "../crates/mayo" }
+rand = "0.8"
+vector-commit = { path = "../crates/vector-commit" }
+vole-act = { path = "../crates/vole-act" }
+voleith = { path = "../crates/voleith" }
+
+[[bin]]
+name = "wire_decode"
+path = "fuzz_targets/wire_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proof_verify"
+path = "fuzz_targets/proof_verify.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "protocol_artifacts"
+path = "fuzz_targets/protocol_artifacts.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "corner_cases"
+path = "fuzz_targets/corner_cases.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "protocol_state"
+path = "fuzz_targets/protocol_state.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1

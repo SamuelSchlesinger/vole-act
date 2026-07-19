@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 rand_core = { workspace = true }
+zeroize = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

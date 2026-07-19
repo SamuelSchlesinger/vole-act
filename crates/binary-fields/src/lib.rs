@@ -9,10 +9,9 @@
 //! - [`embed_gf16`]: the field homomorphism `GF(16) ↪ GF(2¹²⁸)` used to lift
 //!   committed F₁₆ values into the tag field.
 //!
-//! All arithmetic is branch-free on secret data (masks and fixed-iteration
-//! loops); no lookup tables are indexed by secrets. Performance work (e.g.
-//! hardware carry-less multiply) is deliberately deferred — correctness and
-//! auditability first.
+//! All arithmetic is branch-free on secret data; no lookup tables are indexed
+//! by secrets. GF(2¹²⁸) multiplication uses PMULL on AArch64 and PCLMULQDQ on
+//! x86-64 when available, with a fixed-iteration portable fallback.
 
 mod embed;
 mod gf16;

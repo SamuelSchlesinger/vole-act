@@ -1,9 +1,10 @@
 //! End-to-end tests of the VOLE-in-the-head NIZK on small circuits.
 
 use binary_fields::{BinaryField, GF2p128, GF16, embed_gf16};
+use rand::RngCore;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
-use voleith::{Backend, Circuit, PARAMS_128, VoleithError, prove, verify};
+use voleith::{Backend, Circuit, PARAMS_128_BALANCED as PARAMS_128, VoleithError, prove, verify};
 
 /// Lift 4 committed bits into an F₁₆-valued wire via the embedding.
 fn lift_gf16<B: Backend>(backend: &mut B, bits: &[B::Wire; 4]) -> B::Wire {
@@ -231,12 +232,12 @@ fn tampered_proofs_rejected() {
     // Tamper with each component and expect rejection.
     {
         let mut p = proof.clone();
-        p.qs_u += GF2p128::ONE;
+        p.qs_coefficients[0] += GF2p128::ONE;
         assert!(verify(&PARAMS_128, b"quadratic", &circuit, &p).is_err());
     }
     {
         let mut p = proof.clone();
-        p.qs_w += GF2p128::ONE;
+        p.qs_coefficients[1] += GF2p128::ONE;
         assert!(verify(&PARAMS_128, b"quadratic", &circuit, &p).is_err());
     }
     {
@@ -246,7 +247,7 @@ fn tampered_proofs_rejected() {
     }
     {
         let mut p = proof.clone();
-        p.v_tilde += GF2p128::ONE;
+        p.v_tilde[0] += GF2p128::ONE;
         assert!(verify(&PARAMS_128, b"quadratic", &circuit, &p).is_err());
     }
     {
@@ -279,6 +280,78 @@ fn tampered_proofs_rejected() {
 
     // Untampered still verifies (sanity).
     verify(&PARAMS_128, b"quadratic", &circuit, &proof).unwrap();
+}
+
+#[test]
+fn proof_wire_codec_is_canonical_and_fail_closed() {
+    let mut rng = StdRng::seed_from_u64(0x51_5245);
+    let x = GF16::new(9);
+    let circuit = QuadraticCircuit { c: x.square() + x };
+    let proof = prove(
+        &PARAMS_128,
+        b"proof-wire",
+        &circuit,
+        &gf16_bits(x),
+        &mut rng,
+    )
+    .unwrap();
+    let encoded = proof.to_bytes();
+    let decoded = voleith::Proof::from_bytes(&encoded).unwrap();
+    assert_eq!(decoded.to_bytes(), encoded);
+    verify(&PARAMS_128, b"proof-wire", &circuit, &decoded).unwrap();
+
+    for cut in [0, 1, 4, encoded.len() / 2, encoded.len() - 1] {
+        assert!(voleith::Proof::from_bytes(&encoded[..cut]).is_err());
+    }
+    let mut trailing = encoded.clone();
+    trailing.push(0);
+    assert!(voleith::Proof::from_bytes(&trailing).is_err());
+
+    // The first correction's logical bit length begins after magic, salt,
+    // commitments, and the correction count. Give it an impossible u64
+    // length; the decoder must reject before allocating.
+    let mut huge = encoded;
+    let first_correction_len = 5 + 16 + 4 + PARAMS_128.tau * 32 + 4;
+    huge[first_correction_len..first_correction_len + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+    assert!(voleith::Proof::from_bytes(&huge).is_err());
+}
+
+#[test]
+fn sampled_wire_mutations_never_turn_into_an_accepted_proof() {
+    let mut rng = StdRng::seed_from_u64(0xADDE_525A);
+    let x = GF16::new(13);
+    let circuit = QuadraticCircuit { c: x.square() + x };
+    let proof = prove(
+        &PARAMS_128,
+        b"mutation-campaign",
+        &circuit,
+        &gf16_bits(x),
+        &mut rng,
+    )
+    .unwrap();
+    let encoded = proof.to_bytes();
+    let samples = 96usize.min(encoded.len());
+    for sample in 0..samples {
+        let index = sample * encoded.len() / samples;
+        let mut mutated = encoded.clone();
+        mutated[index] ^= 1 << (sample % 8);
+        if let Ok(decoded) = voleith::Proof::from_bytes(&mutated) {
+            assert!(
+                verify(&PARAMS_128, b"mutation-campaign", &circuit, &decoded).is_err(),
+                "wire mutation at byte {index} survived verification"
+            );
+        }
+    }
+
+    // Parser smoke-fuzzing: arbitrary short inputs must be rejected or parsed
+    // without panicking; no parsed garbage may verify this statement.
+    for length in 0..256usize {
+        let mut garbage = vec![0u8; length];
+        rng.fill_bytes(&mut garbage);
+        if let Ok(decoded) = voleith::Proof::from_bytes(&garbage) {
+            assert!(verify(&PARAMS_128, b"mutation-campaign", &circuit, &decoded).is_err());
+        }
+    }
 }
 
 /// Prove knowledge of x, y ∈ GF(16) satisfying the two-equation system
@@ -368,4 +441,50 @@ fn quad_system_completeness_and_soundness() {
             assert!(verify(&PARAMS_128, b"system", &bad, &proof).is_err());
         }
     }
+}
+
+/// Exercise the generalized polynomial-expression backend above degree two.
+struct DegreeFourCircuit {
+    fourth_power: GF16,
+}
+
+impl Circuit for DegreeFourCircuit {
+    fn build<B: Backend>(&self, backend: &mut B) -> Result<(), VoleithError> {
+        let bits: [B::Wire; 4] = [
+            backend.witness_bit()?,
+            backend.witness_bit()?,
+            backend.witness_bit()?,
+            backend.witness_bit()?,
+        ];
+        let x = lift_gf16(backend, &bits);
+        let x = backend.wire_expr(&x);
+        let square = backend.expr_mul(&x, &x);
+        let fourth = backend.expr_mul(&square, &square);
+        let constant = backend.constant(embed_gf16(self.fourth_power));
+        let constant = backend.wire_expr(&constant);
+        let relation = backend.expr_add(&fourth, &constant);
+        backend.assert_expr_zero(&relation);
+        Ok(())
+    }
+}
+
+#[test]
+fn degree_four_completeness_and_soundness() {
+    let mut rng = StdRng::seed_from_u64(8);
+    let x = GF16::new(11);
+    let circuit = DegreeFourCircuit {
+        fourth_power: x.square().square(),
+    };
+    let witness = gf16_bits(x);
+    let proof = prove(&PARAMS_128, b"degree-four", &circuit, &witness, &mut rng).unwrap();
+    verify(&PARAMS_128, b"degree-four", &circuit, &proof).unwrap();
+
+    let wrong = DegreeFourCircuit {
+        fourth_power: circuit.fourth_power + GF16::ONE,
+    };
+    assert_eq!(
+        prove(&PARAMS_128, b"degree-four", &wrong, &witness, &mut rng).unwrap_err(),
+        VoleithError::Unsatisfiable
+    );
+    assert!(verify(&PARAMS_128, b"degree-four", &wrong, &proof).is_err());
 }

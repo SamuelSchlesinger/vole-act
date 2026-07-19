@@ -7,6 +7,7 @@ members = [
     "crates/mayo",
     "crates/vole-act",
 ]
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.0"
@@ -23,6 +24,7 @@ mayo = { path = "crates/mayo" }
 # External
 rand_core = "0.6.4"
 sha3 = "0.10"
+zeroize = "1.8"
 
 # Dev
 proptest = "1"

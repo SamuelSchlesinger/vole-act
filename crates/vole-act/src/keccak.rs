@@ -1,18 +1,18 @@
-//! Native Keccak-f[1600] and the SHAKE256 sponge, with round-by-round
+//! Native `Keccak-f[1600]` and the SHAKE256 sponge, with round-by-round
 //! access.
 //!
 //! The ACT circuits prove SHAKE256 evaluations *inside* the NIZK, which
 //! requires (a) a bit-level view of every permutation round to generate the
 //! witness (the intermediate round states), and (b) an exactly matching
 //! native implementation for everything computed in the clear. The `sha3`
-//! crate exposes neither, so this module implements Keccak-f[1600] directly;
+//! crate exposes neither, so this module implements `Keccak-f[1600]` directly;
 //! its output is tested against `sha3` to rule out divergence.
 //!
 //! State layout: 25 lanes `A[x + 5y]` of 64 bits each, lane bit `z` = bit
 //! `64·(x + 5y) + z` of the 1600-bit state, matching FIPS 202's mapping of
 //! the sponge's byte string into lanes (lane (x,y) little-endian).
 
-/// Number of rounds in Keccak-f[1600].
+/// Number of rounds in `Keccak-f[1600]`.
 pub const ROUNDS: usize = 24;
 
 /// The SHAKE256 rate in bytes (1088 bits).
@@ -58,7 +58,7 @@ pub const RHO: [u32; 25] = [
 /// A Keccak state: 25 little-endian 64-bit lanes.
 pub type State = [u64; 25];
 
-/// One round of Keccak-f[1600].
+/// One round of `Keccak-f[1600]`.
 #[must_use]
 pub fn round(a: &State, rc: u64) -> State {
     // θ: column parities.
@@ -98,7 +98,7 @@ pub fn round(a: &State, rc: u64) -> State {
     out
 }
 
-/// The full Keccak-f[1600] permutation.
+/// The full `Keccak-f[1600]` permutation.
 #[must_use]
 pub fn keccak_f(mut a: State) -> State {
     for rc in RC {

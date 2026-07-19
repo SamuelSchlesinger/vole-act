@@ -5,6 +5,7 @@ use core::fmt;
 use core::iter::{Product, Sum};
 use core::ops::{Add, AddAssign, Mul, MulAssign, Sub, SubAssign};
 use rand_core::CryptoRngCore;
+use zeroize::Zeroize;
 
 /// An element of `GF(2¹²⁸) = F₂[x]/(x¹²⁸ + x⁷ + x² + x + 1)`.
 ///
@@ -13,6 +14,12 @@ use rand_core::CryptoRngCore;
 /// FAEST's `F₂₁₂₈` and by GHASH (in non-reflected bit order).
 #[derive(Clone, Copy, PartialEq, Eq, Default, Hash)]
 pub struct GF2p128(u128);
+
+impl Zeroize for GF2p128 {
+    fn zeroize(&mut self) {
+        self.0.zeroize();
+    }
+}
 
 impl GF2p128 {
     /// Low bits of the reduction polynomial: `x⁷ + x² + x + 1`.
@@ -47,6 +54,83 @@ impl GF2p128 {
     const fn mul_x(v: u128) -> u128 {
         let carry = 0u128.wrapping_sub(v >> 127);
         (v << 1) ^ (carry & Self::POLY_LOW)
+    }
+
+    /// Portable constant-time multiplication used on targets without a
+    /// carry-less multiply instruction and as the test oracle for fast paths.
+    #[inline]
+    fn mul_portable(a: u128, b: u128) -> u128 {
+        let mut acc = 0;
+        let mut shifted = a;
+        let mut i = 0;
+        while i < 128 {
+            let mask = 0u128.wrapping_sub((b >> i) & 1);
+            acc ^= shifted & mask;
+            shifted = Self::mul_x(shifted);
+            i += 1;
+        }
+        acc
+    }
+
+    /// Reduce a 256-bit carry-less product modulo
+    /// `x^128 + x^7 + x^2 + x + 1`.
+    #[inline]
+    fn reduce_product(low: u128, high: u128) -> u128 {
+        // Fold `high*x^128` with x^128 = r, r = 0x87. Multiplication by r
+        // can overflow by at most seven bits, which are folded once more.
+        let folded = high ^ (high << 1) ^ (high << 2) ^ (high << 7);
+        let overflow = (high >> 127) ^ (high >> 126) ^ (high >> 121);
+        let folded_overflow = overflow ^ (overflow << 1) ^ (overflow << 2) ^ (overflow << 7);
+        low ^ folded ^ folded_overflow
+    }
+
+    #[inline]
+    fn reduce_karatsuba(p0: u128, p1: u128, middle: u128) -> u128 {
+        let low = (p0 as u64 as u128) | (((p0 >> 64) ^ (middle as u64 as u128)) << 64);
+        let high = ((middle >> 64) ^ (p1 as u64 as u128)) | ((p1 >> 64) << 64);
+        Self::reduce_product(low, high)
+    }
+
+    /// Three PMULL instructions with Karatsuba produce the unreduced 256-bit
+    /// polynomial product.
+    #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "aes")]
+    unsafe fn mul_pmull(a: u128, b: u128) -> u128 {
+        use core::arch::aarch64::vmull_p64;
+
+        let a0 = a as u64;
+        let a1 = (a >> 64) as u64;
+        let b0 = b as u64;
+        let b1 = (b >> 64) as u64;
+        let p0 = vmull_p64(a0, b0);
+        let p1 = vmull_p64(a1, b1);
+        let middle = vmull_p64(a0 ^ a1, b0 ^ b1) ^ p0 ^ p1;
+        Self::reduce_karatsuba(p0, p1, middle)
+    }
+
+    /// Three PCLMULQDQ instructions with Karatsuba, for x86-64 hosts.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "pclmulqdq")]
+    unsafe fn mul_pclmul(a: u128, b: u128) -> u128 {
+        use core::arch::x86_64::{__m128i, _mm_clmulepi64_si128};
+
+        // SAFETY: `u128` and `__m128i` are both 128-bit bit containers. Lane
+        // zero receives the low-order polynomial coefficients on little-endian
+        // x86-64.
+        let av: __m128i = unsafe { core::mem::transmute(a) };
+        let bv: __m128i = unsafe { core::mem::transmute(b) };
+        let p0v = _mm_clmulepi64_si128::<0x00>(av, bv);
+        let p1v = _mm_clmulepi64_si128::<0x11>(av, bv);
+        let ax = (a as u64) ^ ((a >> 64) as u64);
+        let bx = (b as u64) ^ ((b >> 64) as u64);
+        let axv: __m128i = unsafe { core::mem::transmute(ax as u128) };
+        let bxv: __m128i = unsafe { core::mem::transmute(bx as u128) };
+        let middle_v = _mm_clmulepi64_si128::<0x00>(axv, bxv);
+        let p0: u128 = unsafe { core::mem::transmute(p0v) };
+        let p1: u128 = unsafe { core::mem::transmute(p1v) };
+        let middle_product: u128 = unsafe { core::mem::transmute(middle_v) };
+        let middle = middle_product ^ p0 ^ p1;
+        Self::reduce_karatsuba(p0, p1, middle)
     }
 }
 
@@ -89,23 +173,21 @@ impl Sub for GF2p128 {
 impl Mul for GF2p128 {
     type Output = Self;
 
-    /// Russian-peasant carry-less multiply with interleaved reduction.
-    ///
-    /// Fixed 128 iterations, mask-based conditionals: branch-free on secret
-    /// operands. (Hardware carry-less multiply is a deferred optimization;
-    /// see the crate docs.)
+    /// Carry-less multiplication with hardware acceleration when available.
+    /// The portable fallback has a fixed 128-iteration, branch-free schedule.
+    #[inline]
     fn mul(self, rhs: Self) -> Self {
-        let mut acc: u128 = 0;
-        let mut a = self.0;
-        let b = rhs.0;
-        let mut i = 0;
-        while i < 128 {
-            let mask = 0u128.wrapping_sub((b >> i) & 1);
-            acc ^= a & mask;
-            a = Self::mul_x(a);
-            i += 1;
+        #[cfg(target_arch = "aarch64")]
+        if std::arch::is_aarch64_feature_detected!("aes") {
+            // SAFETY: the runtime feature check gates the PMULL target feature.
+            return GF2p128(unsafe { Self::mul_pmull(self.0, rhs.0) });
         }
-        GF2p128(acc)
+        #[cfg(target_arch = "x86_64")]
+        if std::arch::is_x86_feature_detected!("pclmulqdq") {
+            // SAFETY: the runtime feature check gates PCLMULQDQ.
+            return GF2p128(unsafe { Self::mul_pclmul(self.0, rhs.0) });
+        }
+        GF2p128(Self::mul_portable(self.0, rhs.0))
     }
 }
 
@@ -188,6 +270,26 @@ mod tests {
     }
 
     proptest! {
+        #[test]
+        #[cfg(target_arch = "aarch64")]
+        fn pmull_matches_portable(a: u128, b: u128) {
+            if std::arch::is_aarch64_feature_detected!("aes") {
+                // SAFETY: guarded by the target-feature check.
+                let fast = unsafe { GF2p128::mul_pmull(a, b) };
+                prop_assert_eq!(fast, GF2p128::mul_portable(a, b));
+            }
+        }
+
+        #[test]
+        #[cfg(target_arch = "x86_64")]
+        fn pclmul_matches_portable(a: u128, b: u128) {
+            if std::arch::is_x86_feature_detected!("pclmulqdq") {
+                // SAFETY: guarded by the target-feature check.
+                let fast = unsafe { GF2p128::mul_pclmul(a, b) };
+                prop_assert_eq!(fast, GF2p128::mul_portable(a, b));
+            }
+        }
+
         #[test]
         fn commutativity(a: u128, b: u128) {
             let (a, b) = (GF2p128::new(a), GF2p128::new(b));

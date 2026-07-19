@@ -58,6 +58,9 @@ pub struct QuadTerm<W> {
 pub trait Backend {
     /// A linearly-homomorphic commitment to an `F₂^λ` element.
     type Wire: Clone;
+    /// A bounded-degree polynomial expression in committed wires. Its leading
+    /// coefficient is the value of the represented circuit expression.
+    type Expr: Clone;
 
     /// Allocate the next witness bit.
     fn witness_bit(&mut self) -> Result<Self::Wire, VoleithError>;
@@ -93,6 +96,18 @@ pub trait Backend {
     ///
     /// Every `terms[t].coeffs` must have length `linear.len()`.
     fn assert_quad_system(&mut self, terms: Vec<QuadTerm<Self::Wire>>, linear: Vec<Self::Wire>);
+
+    /// Lift a degree-1 committed wire into the polynomial-expression layer.
+    fn wire_expr(&mut self, wire: &Self::Wire) -> Self::Expr;
+
+    /// Add two expressions, aligning their leading (value) coefficients.
+    fn expr_add(&mut self, a: &Self::Expr, b: &Self::Expr) -> Self::Expr;
+
+    /// Multiply two expressions. Degrees add.
+    fn expr_mul(&mut self, a: &Self::Expr, b: &Self::Expr) -> Self::Expr;
+
+    /// Assert that an expression's leading/value coefficient is zero.
+    fn assert_expr_zero(&mut self, expression: &Self::Expr);
 }
 
 /// Prover wire: the actual value and its VOLE tag.
@@ -109,6 +124,14 @@ pub enum ProverConstraint {
     Simple(GF2p128, GF2p128),
     /// A deferred quadratic system, folded with challenge randomness.
     System(ProverQuadSystem),
+    /// A fully materialized polynomial whose leading coefficient must vanish.
+    Polynomial(Vec<GF2p128>),
+}
+
+/// Prover-side polynomial expression, coefficients in low-to-high order.
+#[derive(Clone, Debug)]
+pub struct ProverExpr {
+    coefficients: Vec<GF2p128>,
 }
 
 /// Prover-side stored quadratic system (values and tags of every term).
@@ -128,10 +151,9 @@ impl ProverQuadSystem {
 
     /// Fold the system with challenge coefficients `phis` into a single
     /// QuickSilver `(A₀, A₁)` pair; also returns whether the folded
-    /// equation holds for the witness (false detects an unsatisfied system
-    /// except with probability 2^−λ).
+    /// equation's leading/error coefficient (zero for a satisfied fold).
     #[must_use]
-    pub fn fold(&self, phis: &[GF2p128]) -> (GF2p128, GF2p128, bool) {
+    pub fn fold(&self, phis: &[GF2p128]) -> (GF2p128, GF2p128, GF2p128) {
         assert_eq!(phis.len(), self.linear.len());
         let tables: Vec<[GF2p128; 16]> = phis.iter().map(|&p| fold_table(p)).collect();
         let mut a0 = GF2p128::ZERO;
@@ -147,7 +169,7 @@ impl ProverQuadSystem {
             a1 += *phi * *tl;
             value += *phi * *vl;
         }
-        (a0, a1, value == GF2p128::ZERO)
+        (a0, a1, value)
     }
 }
 
@@ -192,6 +214,7 @@ impl<'a> ProverBackend<'a> {
 
 impl Backend for ProverBackend<'_> {
     type Wire = ProverWire;
+    type Expr = ProverExpr;
 
     fn witness_bit(&mut self) -> Result<ProverWire, VoleithError> {
         let t = self.next;
@@ -266,6 +289,45 @@ impl Backend for ProverBackend<'_> {
                 linear: linear.into_iter().map(|w| (w.value, w.tag)).collect(),
             }));
     }
+
+    fn wire_expr(&mut self, wire: &ProverWire) -> ProverExpr {
+        ProverExpr {
+            coefficients: vec![wire.tag, wire.value],
+        }
+    }
+
+    fn expr_add(&mut self, a: &ProverExpr, b: &ProverExpr) -> ProverExpr {
+        let len = a.coefficients.len().max(b.coefficients.len());
+        let mut coefficients = vec![GF2p128::ZERO; len];
+        let a_shift = len - a.coefficients.len();
+        let b_shift = len - b.coefficients.len();
+        for (index, coefficient) in a.coefficients.iter().enumerate() {
+            coefficients[a_shift + index] += *coefficient;
+        }
+        for (index, coefficient) in b.coefficients.iter().enumerate() {
+            coefficients[b_shift + index] += *coefficient;
+        }
+        ProverExpr { coefficients }
+    }
+
+    fn expr_mul(&mut self, a: &ProverExpr, b: &ProverExpr) -> ProverExpr {
+        let mut coefficients = vec![GF2p128::ZERO; a.coefficients.len() + b.coefficients.len() - 1];
+        for (i, left) in a.coefficients.iter().enumerate() {
+            for (j, right) in b.coefficients.iter().enumerate() {
+                coefficients[i + j] += *left * *right;
+            }
+        }
+        ProverExpr { coefficients }
+    }
+
+    fn assert_expr_zero(&mut self, expression: &ProverExpr) {
+        if expression.coefficients.last() != Some(&GF2p128::ZERO) {
+            self.satisfied = false;
+        }
+        self.constraints.push(ProverConstraint::Polynomial(
+            expression.coefficients.clone(),
+        ));
+    }
 }
 
 /// A recorded verifier-side constraint.
@@ -274,6 +336,8 @@ pub enum VerifierConstraint {
     Simple(GF2p128),
     /// A deferred quadratic system over keys.
     System(VerifierQuadSystem),
+    /// Evaluation at `Δ` together with the polynomial degree.
+    Polynomial(GF2p128, usize),
 }
 
 /// Verifier-side stored quadratic system (keys of every term).
@@ -345,8 +409,17 @@ pub struct VerifierWire {
     key: GF2p128,
 }
 
+/// Verifier-side polynomial expression: only its evaluation at `Δ` and
+/// its degree are needed.
+#[derive(Clone, Debug)]
+pub struct VerifierExpr {
+    evaluation: GF2p128,
+    degree: usize,
+}
+
 impl Backend for VerifierBackend<'_> {
     type Wire = VerifierWire;
+    type Expr = VerifierExpr;
 
     fn witness_bit(&mut self) -> Result<VerifierWire, VoleithError> {
         let t = self.next;
@@ -402,6 +475,36 @@ impl Backend for VerifierBackend<'_> {
                 linear: linear.into_iter().map(|w| w.key).collect(),
             }));
     }
+
+    fn wire_expr(&mut self, wire: &VerifierWire) -> VerifierExpr {
+        VerifierExpr {
+            evaluation: wire.key,
+            degree: 1,
+        }
+    }
+
+    fn expr_add(&mut self, a: &VerifierExpr, b: &VerifierExpr) -> VerifierExpr {
+        let degree = a.degree.max(b.degree);
+        VerifierExpr {
+            evaluation: a.evaluation * self.delta.pow((degree - a.degree) as u128)
+                + b.evaluation * self.delta.pow((degree - b.degree) as u128),
+            degree,
+        }
+    }
+
+    fn expr_mul(&mut self, a: &VerifierExpr, b: &VerifierExpr) -> VerifierExpr {
+        VerifierExpr {
+            evaluation: a.evaluation * b.evaluation,
+            degree: a.degree + b.degree,
+        }
+    }
+
+    fn assert_expr_zero(&mut self, expression: &VerifierExpr) {
+        self.checks.push(VerifierConstraint::Polynomial(
+            expression.evaluation,
+            expression.degree,
+        ));
+    }
 }
 
 /// Counting backend: sizes the circuit (witness bits, constraints) without
@@ -412,10 +515,13 @@ pub struct CountingBackend {
     pub witness_bits: usize,
     /// Number of constraints recorded.
     pub constraints: usize,
+    /// Maximum asserted polynomial degree.
+    pub max_degree: usize,
 }
 
 impl Backend for CountingBackend {
     type Wire = ();
+    type Expr = usize;
 
     fn witness_bit(&mut self) -> Result<(), VoleithError> {
         self.witness_bits += 1;
@@ -430,13 +536,33 @@ impl Backend for CountingBackend {
 
     fn assert_zero(&mut self, _a: &()) {
         self.constraints += 1;
+        self.max_degree = self.max_degree.max(2);
     }
 
     fn assert_mul(&mut self, _a: &(), _b: &(), _c: &()) {
         self.constraints += 1;
+        self.max_degree = self.max_degree.max(2);
     }
 
     fn assert_quad_system(&mut self, _terms: Vec<QuadTerm<()>>, _linear: Vec<()>) {
         self.constraints += 1;
+        self.max_degree = self.max_degree.max(2);
+    }
+
+    fn wire_expr(&mut self, _wire: &()) -> usize {
+        1
+    }
+
+    fn expr_add(&mut self, a: &usize, b: &usize) -> usize {
+        (*a).max(*b)
+    }
+
+    fn expr_mul(&mut self, a: &usize, b: &usize) -> usize {
+        *a + *b
+    }
+
+    fn assert_expr_zero(&mut self, expression: &usize) {
+        self.constraints += 1;
+        self.max_degree = self.max_degree.max(*expression);
     }
 }
