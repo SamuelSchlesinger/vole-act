@@ -18,6 +18,7 @@
 
 use crate::bits::BitVec;
 use binary_fields::{BinaryField, GF2p128};
+#[cfg(feature = "parallel")]
 use rayon::prelude::*;
 use sha3::Shake256;
 use sha3::digest::{ExtendableOutput, Update, XofReader};
@@ -240,11 +241,15 @@ impl ProverVole {
             return Err(VcError::InvalidParameters);
         }
 
-        // The τ trees are independent; expand them in parallel and collect
-        // in index order, so the assembled outputs (and hence the transcript)
-        // are identical to the sequential walk.
-        let per_tree: Result<Vec<_>, VcError> = (0..params.tau)
-            .into_par_iter()
+        // The τ trees are independent; with the `parallel` feature they
+        // expand on the rayon pool and collect in index order, so the
+        // assembled outputs (and hence the transcript) are identical to the
+        // sequential walk.
+        #[cfg(feature = "parallel")]
+        let tree_indices = (0..params.tau).into_par_iter();
+        #[cfg(not(feature = "parallel"))]
+        let tree_indices = 0..params.tau;
+        let per_tree: Result<Vec<_>, VcError> = tree_indices
             .map(|j| {
                 let (vc, com) =
                     AllButOneVc::commit(root_seeds[j], tree_salt(salt, j), params.k as u32)?;
@@ -331,15 +336,19 @@ pub fn reconstruct_keys(
         return Err(VcError::InvalidOpening);
     }
 
-    // The τ trees reconstruct independently; parallel with in-order collect,
-    // identical outputs to the sequential walk. The accumulator walks leaves
+    // The τ trees reconstruct independently; under the `parallel` feature
+    // this runs on the rayon pool with in-order collect, identical outputs
+    // to the sequential walk. The accumulator walks leaves
     // in `e = i ⊕ Δ` order (the hole i = Δ becomes the zero vector at e = 0),
     // which computes exactly `planes[b] = Σ_{bit_b(e)=1} r_{e⊕Δ}` — the same
     // sums as the definitional per-leaf loop; the SHAKE leaf expansions are
     // position-keyed and order-independent.
     let n = params.leaves();
-    let planes: Result<Vec<Vec<BitVec>>, VcError> = (0..params.tau)
-        .into_par_iter()
+    #[cfg(feature = "parallel")]
+    let tree_indices = (0..params.tau).into_par_iter();
+    #[cfg(not(feature = "parallel"))]
+    let tree_indices = 0..params.tau;
+    let planes: Result<Vec<Vec<BitVec>>, VcError> = tree_indices
         .map(|j| {
             let delta = deltas[j];
             let leaves = AllButOneVc::verify(

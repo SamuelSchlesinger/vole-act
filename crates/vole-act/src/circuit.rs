@@ -1,12 +1,12 @@
 //! ACT circuit construction and native witness generation.
 //!
 //! The circuit deliberately mirrors the statement in `docs/DESIGN.md`:
-//! MAYO verification and two or three SHAKE256 evaluations are connected to
-//! exact 64-bit balance equations. Direct credentials require the old and
-//! fresh commitment hashes; deferred-return credentials add a wrapper hash
-//! binding the old base commitment and issuer-selected top-up. Every secret
-//! scalar is allocated as bits; GF(16) values are obtained only through the
-//! canonical embedding into the VOLE tag field.
+//! MAYO verification and three SHAKE256 evaluations are connected to exact
+//! 64-bit balance equations. Every credential authenticates a signer-salted
+//! wrapper around its base commitment and return amount, so direct and
+//! deferred-return inputs have one common hash shape. Every secret scalar is
+//! allocated as bits; GF(16) values are obtained only through the canonical
+//! embedding into the VOLE tag field.
 
 use crate::keccak::{self, RATE_BYTES, RC, RHO, State};
 use binary_fields::{BinaryField, GF2p128, GF16, embed_gf16};
@@ -15,11 +15,13 @@ use std::marker::PhantomData;
 use voleith::{Backend, Circuit, QuadTerm, SharedCoeffs, VoleithError};
 
 pub(crate) const CRED_DOMAIN: &[u8] = b"VOLE-ACT/credential/v2";
-// Keep the wrapper below one SHAKE256 rate block even for MAYO5's 71-byte
-// target: 20 + 32 + 71 + 8 = 131 < 136.  The circuit deliberately handles
-// one absorb block so all parameter sets must satisfy this bound.
-pub(crate) const DEFERRED_TOKEN_DOMAIN: &[u8] = b"VOLE-ACT/deferred/v2";
+// The base commitment already binds the protocol context. Omitting a repeated
+// context here leaves room for a 256-bit signer salt while keeping even
+// MAYO5's wrapper in one SHAKE256 rate block:
+// 18 + 71 + 8 + 32 = 129 < 136.
+pub(crate) const SIGNED_TOKEN_DOMAIN: &[u8] = b"VOLE-ACT/signed/v3";
 pub(crate) const BALANCE_BITS: usize = 64;
+pub(crate) const SALT_BYTES: usize = 32;
 const KEY_BYTES: usize = 32;
 const NONCE_BYTES: usize = 32;
 
@@ -135,29 +137,29 @@ fn pack_gf16(values: &[GF16]) -> Vec<u8> {
 }
 
 pub(crate) fn token_message<P: MayoParams>(
-    context: &[u8; 32],
     commitment: &[GF16],
     topup: u64,
+    salt: &[u8; SALT_BYTES],
 ) -> Vec<u8> {
     debug_assert_eq!(commitment.len(), P::M);
     let packed = pack_gf16(commitment);
-    let mut msg = Vec::with_capacity(DEFERRED_TOKEN_DOMAIN.len() + 32 + packed.len() + 8);
-    msg.extend_from_slice(DEFERRED_TOKEN_DOMAIN);
-    msg.extend_from_slice(context);
+    let mut msg = Vec::with_capacity(SIGNED_TOKEN_DOMAIN.len() + packed.len() + 8 + SALT_BYTES);
+    msg.extend_from_slice(SIGNED_TOKEN_DOMAIN);
     msg.extend_from_slice(&packed);
     msg.extend_from_slice(&topup.to_le_bytes());
+    msg.extend_from_slice(salt);
     debug_assert!(msg.len() < RATE_BYTES);
     msg
 }
 
-/// MAYO target binding the hidden base commitment and issuer-selected top-up.
+/// MAYO target binding the hidden base commitment, return, and signer salt.
 pub(crate) fn signed_token_target<P: MayoParams>(
-    context: &[u8; 32],
     commitment: &[GF16],
     topup: u64,
+    salt: &[u8; SALT_BYTES],
 ) -> Vec<GF16> {
     let bytes = keccak::shake256(
-        &token_message::<P>(context, commitment, topup),
+        &token_message::<P>(commitment, topup, salt),
         P::M.div_ceil(2),
     );
     (0..P::M)
@@ -416,18 +418,19 @@ fn credential_wires<B: Backend>(
 
 fn token_wires<B: Backend>(
     backend: &mut B,
-    context: &[u8; 32],
     commitment: &[B::Wire],
     topup: &[B::Wire],
+    salt: &[B::Wire],
 ) -> Vec<B::Wire> {
     debug_assert_eq!(topup.len(), BALANCE_BITS);
-    let mut msg = constant_bytes(backend, DEFERRED_TOKEN_DOMAIN);
-    msg.extend(constant_bytes(backend, context));
+    debug_assert_eq!(salt.len(), SALT_BYTES * 8);
+    let mut msg = constant_bytes(backend, SIGNED_TOKEN_DOMAIN);
     msg.extend(commitment.iter().cloned());
     while !msg.len().is_multiple_of(8) {
         msg.push(constant_bit(backend, false));
     }
     msg.extend(topup.iter().cloned());
+    msg.extend(salt.iter().cloned());
     debug_assert_eq!(msg.len() % 8, 0);
     msg
 }
@@ -531,6 +534,7 @@ pub(crate) struct SpendSecrets<'a> {
     pub base_balance: u64,
     pub nonce: &'a [u8; 32],
     pub topup: u64,
+    pub salt: &'a [u8; SALT_BYTES],
     pub fresh_key: &'a [u8; 32],
     pub fresh_base_balance: u64,
     pub fresh_nonce: &'a [u8; 32],
@@ -542,31 +546,26 @@ impl<P: MayoParams> SpendCircuit<'_, P> {
         witness.extend(bytes_bits(secrets.key));
         witness.extend(u64_bits(secrets.base_balance));
         witness.extend(bytes_bits(secrets.nonce));
-        match self.input_kind {
-            InputCredentialKind::Direct => {
-                debug_assert_eq!(secrets.topup, 0);
-            }
-            InputCredentialKind::DeferredReturn => {
-                witness.extend(u64_bits(secrets.topup));
-                let effective_balance = secrets
-                    .base_balance
-                    .checked_add(secrets.topup)
-                    .expect("a valid token balance cannot overflow");
-                witness.extend(u64_bits(effective_balance));
-            }
+        if self.input_kind == InputCredentialKind::Direct {
+            debug_assert_eq!(secrets.topup, 0);
         }
+        witness.extend(u64_bits(secrets.topup));
+        let effective_balance = secrets
+            .base_balance
+            .checked_add(secrets.topup)
+            .expect("a valid token balance cannot overflow");
+        witness.extend(u64_bits(effective_balance));
+        witness.extend(bytes_bits(secrets.salt));
         witness.extend(bytes_bits(secrets.fresh_key));
         witness.extend(u64_bits(secrets.fresh_base_balance));
         witness.extend(bytes_bits(secrets.fresh_nonce));
 
-        if self.input_kind == InputCredentialKind::DeferredReturn {
-            let mut carry = 0;
-            for bit in 0..BALANCE_BITS {
-                let a = (secrets.base_balance >> bit) & 1;
-                let b = (secrets.topup >> bit) & 1;
-                carry = (a & b) | (carry & (a ^ b));
-                witness.push(carry == 1);
-            }
+        let mut carry = 0;
+        for bit in 0..BALANCE_BITS {
+            let a = (secrets.base_balance >> bit) & 1;
+            let b = (secrets.topup >> bit) & 1;
+            carry = (a & b) | (carry & (a ^ b));
+            witness.push(carry == 1);
         }
         let mut carry = 0;
         for bit in 0..BALANCE_BITS {
@@ -591,12 +590,10 @@ impl<P: MayoParams> SpendCircuit<'_, P> {
                 secrets.nonce,
             ),
         );
-        if self.input_kind == InputCredentialKind::DeferredReturn {
-            append_keccak_checkpoints(
-                &mut witness,
-                &token_message::<P>(&self.context, &old_commitment, secrets.topup),
-            );
-        }
+        append_keccak_checkpoints(
+            &mut witness,
+            &token_message::<P>(&old_commitment, secrets.topup, secrets.salt),
+        );
         append_keccak_checkpoints(
             &mut witness,
             &credential_message(
@@ -613,8 +610,7 @@ impl<P: MayoParams> SpendCircuit<'_, P> {
 impl<P: MayoParams> Circuit for SpendCircuit<'_, P> {
     fn build<B: Backend>(&self, backend: &mut B) -> Result<(), VoleithError> {
         if self.fresh_commitment.len() != P::M
-            || (self.input_kind == InputCredentialKind::DeferredReturn
-                && DEFERRED_TOKEN_DOMAIN.len() + 32 + P::M.div_ceil(2) + 8 >= RATE_BYTES)
+            || SIGNED_TOKEN_DOMAIN.len() + P::M.div_ceil(2) + 8 + SALT_BYTES >= RATE_BYTES
         {
             return Err(VoleithError::InvalidParameters);
         }
@@ -624,80 +620,45 @@ impl<P: MayoParams> Circuit for SpendCircuit<'_, P> {
         let key = alloc_bits(backend, KEY_BYTES * 8)?;
         let base_balance = alloc_bits(backend, BALANCE_BITS)?;
         let nonce = alloc_bits(backend, NONCE_BYTES * 8)?;
-        let (topup, effective_balance) = match self.input_kind {
-            InputCredentialKind::Direct => (None, None),
-            InputCredentialKind::DeferredReturn => (
-                Some(alloc_bits(backend, BALANCE_BITS)?),
-                Some(alloc_bits(backend, BALANCE_BITS)?),
-            ),
-        };
+        let topup = alloc_bits(backend, BALANCE_BITS)?;
+        let effective_balance = alloc_bits(backend, BALANCE_BITS)?;
+        let salt = alloc_bits(backend, SALT_BYTES * 8)?;
         let fresh_key = alloc_bits(backend, KEY_BYTES * 8)?;
         let fresh_base_balance = alloc_bits(backend, BALANCE_BITS)?;
         let fresh_nonce = alloc_bits(backend, NONCE_BYTES * 8)?;
-        let old_carries = match self.input_kind {
-            InputCredentialKind::Direct => None,
-            InputCredentialKind::DeferredReturn => Some(alloc_bits(backend, BALANCE_BITS)?),
-        };
+        let old_carries = alloc_bits(backend, BALANCE_BITS)?;
         let fresh_carries = alloc_bits(backend, BALANCE_BITS)?;
 
         let spend = constant_bytes(backend, &self.spend.to_le_bytes());
-        match self.input_kind {
-            InputCredentialKind::Direct => {
-                // Exact unsigned addition with zero final carry:
-                // `fresh_base + spend = old_balance`.
-                assert_u64_sum(
-                    backend,
-                    &fresh_base_balance,
-                    &spend,
-                    &base_balance,
-                    &fresh_carries,
-                );
-            }
-            InputCredentialKind::DeferredReturn => {
-                // Both equalities are exact unsigned integer additions with a
-                // zero final carry:
-                // `base + topup = effective = fresh_base + spend`.
-                assert_u64_sum(
-                    backend,
-                    &base_balance,
-                    topup.as_deref().expect("deferred top-up wires"),
-                    effective_balance
-                        .as_deref()
-                        .expect("deferred effective-balance wires"),
-                    old_carries.as_deref().expect("deferred carry wires"),
-                );
-                assert_u64_sum(
-                    backend,
-                    &fresh_base_balance,
-                    &spend,
-                    effective_balance
-                        .as_deref()
-                        .expect("deferred effective-balance wires"),
-                    &fresh_carries,
-                );
+        if self.input_kind == InputCredentialKind::Direct {
+            for wire in &topup {
+                backend.assert_zero(wire);
             }
         }
+        // Both equalities are exact unsigned integer additions with a zero
+        // final carry: `base + topup = effective = fresh_base + spend`.
+        assert_u64_sum(
+            backend,
+            &base_balance,
+            &topup,
+            &effective_balance,
+            &old_carries,
+        );
+        assert_u64_sum(
+            backend,
+            &fresh_base_balance,
+            &spend,
+            &effective_balance,
+            &fresh_carries,
+        );
 
         let old_msg = credential_wires(backend, &self.context, &key, &base_balance, &nonce);
         let old_output = shake_hidden_output(backend, &old_msg, 4 * P::M + 256)?;
         let old_commitment_bits = &old_output[..4 * P::M];
 
-        let signed_target = match self.input_kind {
-            InputCredentialKind::Direct => lift_nibbles(backend, old_commitment_bits),
-            InputCredentialKind::DeferredReturn => {
-                // Deferred-return credentials authenticate a nested hash of
-                // the hidden base commitment and hidden issuer-selected
-                // top-up.
-                let token_msg = token_wires(
-                    backend,
-                    &self.context,
-                    old_commitment_bits,
-                    topup.as_deref().expect("deferred top-up wires"),
-                );
-                let signed_target_bits = shake_hidden_output(backend, &token_msg, 4 * P::M)?;
-                lift_nibbles(backend, &signed_target_bits)
-            }
-        };
+        let token_msg = token_wires(backend, old_commitment_bits, &topup, &salt);
+        let signed_target_bits = shake_hidden_output(backend, &token_msg, 4 * P::M)?;
+        let signed_target = lift_nibbles(backend, &signed_target_bits);
 
         let mayo_terms = self
             .terms
@@ -736,10 +697,10 @@ mod tests {
     use mayo::Mayo5;
 
     #[test]
-    fn largest_deferred_wrapper_fits_one_rate_block() {
+    fn largest_signed_wrapper_fits_one_rate_block() {
         assert!(
-            DEFERRED_TOKEN_DOMAIN.len() + 32 + Mayo5::M.div_ceil(2) + 8 < RATE_BYTES,
-            "MAYO5 deferred wrapper must fit the circuit's single absorb block"
+            SIGNED_TOKEN_DOMAIN.len() + Mayo5::M.div_ceil(2) + 8 + SALT_BYTES < RATE_BYTES,
+            "MAYO5 signed wrapper must fit the circuit's single absorb block"
         );
     }
 

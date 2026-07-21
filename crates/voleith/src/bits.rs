@@ -217,10 +217,10 @@ mod tests {
         let mut t = original;
         transpose64(&mut t);
         for (row, row_word) in t.iter().enumerate() {
-            for column in 0..64 {
+            for (column, original_word) in original.iter().enumerate() {
                 assert_eq!(
                     (row_word >> column) & 1,
-                    (original[column] >> row) & 1,
+                    (original_word >> row) & 1,
                     "transpose bit ({row}, {column})"
                 );
             }

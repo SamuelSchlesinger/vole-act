@@ -2,12 +2,15 @@
 //!
 //! Every artifact begins with a versioned envelope and explicit parameter,
 //! credential-kind, and settlement identifiers. Decoders reject trailing
-//! bytes, non-canonical nibble padding, oversized inputs, and cross-type use.
+//! bytes, non-canonical nibble padding, oversized inputs, and unmodified
+//! wrong-type tags. Envelope identifiers are typed discriminants, not
+//! authenticators: retagged identical-layout bodies may parse, while proof
+//! statements, request digests, and token semantics provide end-to-end binding.
 
 use binary_fields::GF16;
 
 pub(crate) const MAGIC: &[u8; 4] = b"VACT";
-pub(crate) const WIRE_VERSION: u8 = 1;
+pub(crate) const WIRE_VERSION: u8 = 2;
 
 /// Largest individual VOLE-ACT artifact accepted by a canonical decoder.
 pub const MAX_WIRE_BYTES: usize = 32 * 1024 * 1024;

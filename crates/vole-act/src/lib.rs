@@ -3,13 +3,14 @@
 //! Post-quantum anonymous credit tokens from VOLE-in-the-head proofs and the
 //! MAYO trapdoor.
 //!
-//! See `docs/DESIGN.md` at the workspace root for the construction. Core
-//! tokens are MAYO signatures on hidden-balance commitments and ordinary
-//! spends use two hidden SHAKE evaluations. The optional deferred-return
-//! extension wraps a fresh commitment and issuer-selected return in a nested
-//! signed hash; presenting that token requires a third hidden SHAKE. Both
-//! paths prove token possession, exact balance arithmetic, a one-time
-//! nullifier, and well-formedness of a fresh commitment.
+//! See `docs/DESIGN.md` at the workspace root for the construction. Every
+//! token is a MAYO preimage of a signer-salted hash binding a hidden-balance
+//! commitment and return amount. Direct tokens use return zero; the optional
+//! deferred-return extension carries a bounded issuer-selected return, which
+//! may be zero. Both
+//! paths use three hidden SHAKE evaluations and prove token possession, exact
+//! balance arithmetic, a one-time nullifier, and well-formedness of a fresh
+//! commitment.
 //!
 //! ```no_run
 //! # fn main() -> Result<(), vole_act::Error> {
@@ -30,7 +31,7 @@
 //! let response = issuer.spend(&request, &mut rng)?;
 //! let token = pending.finish(&public, &request, &response)?;
 //!
-//! // The extension lets the issuer select a return after verification.
+//! // The extension lets the issuer supply a return after the proved request.
 //! let (pending, request) =
 //!     token.prepare_spend_with_deferred_return(&public, 20, &mut rng)?;
 //! let response = issuer.spend_with_deferred_return(&request, 7, &mut rng)?;

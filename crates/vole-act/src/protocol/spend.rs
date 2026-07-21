@@ -15,6 +15,7 @@ pub struct Token<P: MayoParams = Mayo1, K: CredentialKind = Direct> {
     pub(super) base_balance: u64,
     pub(super) nonce: [u8; 32],
     pub(super) topup: u64,
+    pub(super) salt: [u8; SALT_BYTES],
     pub(super) params: PhantomData<(P, K)>,
 }
 
@@ -26,12 +27,13 @@ impl<P: MayoParams, K: CredentialKind> Drop for Token<P, K> {
         self.base_balance.zeroize();
         self.nonce.zeroize();
         self.topup.zeroize();
+        self.salt.zeroize();
     }
 }
 
 impl<P: MayoParams, K: CredentialKind> ZeroizeOnDrop for Token<P, K> {}
 
-/// Core token format signed directly on its hidden-balance commitment.
+/// Core token format with a zero return in the common salted wrapper.
 pub type DirectToken<P = Mayo1> = Token<P, Direct>;
 
 /// Extension token format carrying a hidden issuer-selected return.
@@ -47,11 +49,12 @@ impl<P: MayoParams, K: CredentialKind> Token<P, K> {
 
     /// Encode this client-held token canonically.
     ///
-    /// The encoding contains the signature, nullifier key, balance, and
-    /// hiding nonce. It is secret local state, not a presentation message.
+    /// The encoding contains the signature, signer salt, nullifier key,
+    /// balance, and hiding nonce. It is secret local state, not a
+    /// presentation message.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(128 + self.signature.len().div_ceil(2));
+        let mut out = Vec::with_capacity(128 + self.signature.len().div_ceil(2) + SALT_BYTES);
         wire::header(&mut out, WIRE_TOKEN, P::WIRE_ID, K::WIRE_ID, 0);
         out.extend_from_slice(&self.context);
         out.extend_from_slice(&wire::pack_nibbles(&self.signature));
@@ -59,6 +62,7 @@ impl<P: MayoParams, K: CredentialKind> Token<P, K> {
         out.extend_from_slice(&self.base_balance.to_le_bytes());
         out.extend_from_slice(&self.nonce);
         out.extend_from_slice(&self.topup.to_le_bytes());
+        out.extend_from_slice(&self.salt);
         out
     }
 
@@ -71,6 +75,7 @@ impl<P: MayoParams, K: CredentialKind> Token<P, K> {
         let base_balance = decoder.u64()?;
         let nonce = decoder.array()?;
         let topup = decoder.u64()?;
+        let salt = decoder.array()?;
         decoder.finish()?;
         if context != public.inner.context || (!K::HAS_TOPUP && topup != 0) {
             return Err(WireError::WrongArtifact);
@@ -82,6 +87,7 @@ impl<P: MayoParams, K: CredentialKind> Token<P, K> {
             base_balance,
             nonce,
             topup,
+            salt,
             params: PhantomData,
         };
         public
@@ -101,8 +107,9 @@ impl<P: MayoParams, K: CredentialKind> Token<P, K> {
         self.prepare_typed_spend::<FixedSpend>(public, amount, rng)
     }
 
-    /// Prepare a spend whose final return is chosen by the issuer only after
-    /// proof verification. The response creates a deferred-return token.
+    /// Prepare a spend whose final return is supplied by the issuer after the
+    /// client fixes this proved request and before signer-salt generation. The
+    /// response creates a deferred-return token.
     pub fn prepare_spend_with_deferred_return(
         &self,
         public: &PublicKey<P>,
@@ -151,6 +158,7 @@ impl<P: MayoParams, K: CredentialKind> Token<P, K> {
             base_balance: self.base_balance,
             nonce: &self.nonce,
             topup: self.topup,
+            salt: &self.salt,
             fresh_key: &fresh_key,
             fresh_base_balance,
             fresh_nonce: &fresh_nonce,
@@ -208,8 +216,8 @@ pub struct TypedSpendRequest<
 /// Request for an ordinary spend that produces a direct token.
 pub type SpendRequest<P = Mayo1, K = Direct> = TypedSpendRequest<P, K, FixedSpend>;
 
-/// Request for a spend whose issuer-selected return is deferred until after
-/// proof verification.
+/// Request for a spend whose issuer-selected return is supplied after the
+/// client fixes the proved request and before signer-salt generation.
 pub type DeferredReturnSpendRequest<P = Mayo1, K = Direct> =
     TypedSpendRequest<P, K, DeferredReturnSpend>;
 
@@ -325,6 +333,7 @@ pub struct TypedSpendResponse<
 > {
     pub(super) signature: Vec<GF16>,
     pub(super) return_amount: u64,
+    pub(super) salt: [u8; SALT_BYTES],
     pub(super) params: PhantomData<(P, K, S)>,
 }
 
@@ -332,6 +341,7 @@ impl<P: MayoParams, K: CredentialKind, S: SettlementMode> Drop for TypedSpendRes
     fn drop(&mut self) {
         self.signature.zeroize();
         self.return_amount.zeroize();
+        self.salt.zeroize();
     }
 }
 
@@ -357,6 +367,7 @@ impl<P: MayoParams, K: CredentialKind, S: SettlementMode> Clone for TypedSpendRe
         Self {
             signature: self.signature.clone(),
             return_amount: self.return_amount,
+            salt: self.salt,
             params: PhantomData,
         }
     }
@@ -366,7 +377,7 @@ impl<P: MayoParams, K: CredentialKind, S: SettlementMode> TypedSpendResponse<P, 
     /// Encode this typed spend response canonically.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(24 + self.signature.len().div_ceil(2));
+        let mut out = Vec::with_capacity(24 + self.signature.len().div_ceil(2) + SALT_BYTES);
         wire::header(
             &mut out,
             WIRE_SPEND_RESPONSE,
@@ -376,6 +387,7 @@ impl<P: MayoParams, K: CredentialKind, S: SettlementMode> TypedSpendResponse<P, 
         );
         out.extend_from_slice(&wire::pack_nibbles(&self.signature));
         out.extend_from_slice(&self.return_amount.to_le_bytes());
+        out.extend_from_slice(&self.salt);
         out
     }
 
@@ -391,6 +403,7 @@ impl<P: MayoParams, K: CredentialKind, S: SettlementMode> TypedSpendResponse<P, 
         )?;
         let signature = decoder.nibbles(P::KN)?;
         let return_amount = decoder.u64()?;
+        let salt = decoder.array()?;
         decoder.finish()?;
         if S::WIRE_ID == FixedSpend::WIRE_ID && return_amount != 0 {
             return Err(WireError::InvalidEncoding);
@@ -398,6 +411,7 @@ impl<P: MayoParams, K: CredentialKind, S: SettlementMode> TypedSpendResponse<P, 
         Ok(Self {
             signature,
             return_amount,
+            salt,
             params: PhantomData,
         })
     }
@@ -550,9 +564,10 @@ impl<P: MayoParams, K: CredentialKind> TypedPendingSpend<P, K, FixedSpend> {
         response: &SpendResponse<P, K>,
     ) -> Result<DirectToken<P>, Error> {
         self.validate_request(public, request)?;
+        let target = signed_token_target::<P>(&self.fresh_commitment, 0, &response.salt);
         let evaluated = mayo::eval(&public.inner.mayo, &response.signature)
             .map_err(|_| Error::InvalidSignature)?;
-        if evaluated != self.fresh_commitment {
+        if evaluated != target {
             return Err(Error::InvalidSignature);
         }
         Ok(Token {
@@ -562,6 +577,7 @@ impl<P: MayoParams, K: CredentialKind> TypedPendingSpend<P, K, FixedSpend> {
             base_balance: self.fresh_base_balance,
             nonce: self.fresh_nonce,
             topup: 0,
+            salt: response.salt,
             params: PhantomData,
         })
     }
@@ -586,9 +602,9 @@ impl<P: MayoParams, K: CredentialKind> TypedPendingSpend<P, K, DeferredReturnSpe
             return Err(Error::InvalidReturnAmount);
         }
         let target = signed_token_target::<P>(
-            &self.context,
             &self.fresh_commitment,
             response.return_amount,
+            &response.salt,
         );
         let evaluated = mayo::eval(&public.inner.mayo, &response.signature)
             .map_err(|_| Error::InvalidSignature)?;
@@ -602,6 +618,7 @@ impl<P: MayoParams, K: CredentialKind> TypedPendingSpend<P, K, DeferredReturnSpe
             base_balance: self.fresh_base_balance,
             nonce: self.fresh_nonce,
             topup: response.return_amount,
+            salt: response.salt,
             params: PhantomData,
         })
     }
@@ -613,7 +630,7 @@ pub(super) fn derive_context<P: MayoParams>(
     profile: PerformanceProfile,
 ) -> [u8; 32] {
     let mut h = sha3::Shake256::default();
-    h.update(b"VOLE-ACT/context/v4");
+    h.update(b"VOLE-ACT/context/v5");
     h.update(&(application_context.len() as u64).to_le_bytes());
     h.update(application_context);
     h.update(public_key_hash);
@@ -679,7 +696,7 @@ pub(super) fn spend_request_digest<P: MayoParams, K: CredentialKind, S: Settleme
     request: &TypedSpendRequest<P, K, S>,
 ) -> [u8; 32] {
     let mut h = sha3::Shake256::default();
-    h.update(b"VOLE-ACT/spend-request-digest/v4");
+    h.update(b"VOLE-ACT/spend-request-digest/v5");
     h.update(context);
     hash_framed(&mut h, &request.to_bytes());
     let mut out = [0u8; 32];

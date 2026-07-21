@@ -23,25 +23,25 @@ pub trait CredentialKind:
     const WIRE_ID: u8;
 }
 
-/// A credential signed directly on its hidden-balance commitment.
+/// A credential with zero return under the common salted wrapper.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Direct;
 
 impl sealed::CredentialKind for Direct {}
 impl CredentialKind for Direct {
-    const TAG: &'static [u8] = b"direct-credential/v1";
+    const TAG: &'static [u8] = b"direct-credential/v2";
     const HAS_TOPUP: bool = false;
     const WIRE_ID: u8 = 1;
 }
 
-/// A credential whose signed target binds a hidden commitment and deferred
-/// issuer-selected return amount.
+/// A credential whose common salted target binds a hidden commitment and
+/// deferred issuer-selected return amount.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeferredReturn;
 
 impl sealed::CredentialKind for DeferredReturn {}
 impl CredentialKind for DeferredReturn {
-    const TAG: &'static [u8] = b"deferred-return-credential/v1";
+    const TAG: &'static [u8] = b"deferred-return-credential/v2";
     const HAS_TOPUP: bool = true;
     const WIRE_ID: u8 = 2;
 }
@@ -57,26 +57,26 @@ pub trait SettlementMode:
     const WIRE_ID: u8;
 }
 
-/// Ordinary spend settlement: sign the fresh commitment directly.
+/// Ordinary spend settlement: sign the common salted wrapper with zero return.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FixedSpend;
 
 impl sealed::SettlementMode for FixedSpend {}
 impl SettlementMode for FixedSpend {
-    const TAG: &'static [u8] = b"fixed-spend/v1";
+    const TAG: &'static [u8] = b"fixed-spend/v2";
     const WIRE_ID: u8 = 1;
 }
 
 /// Deferred-return settlement: sign the fresh commitment and a later issuer
-/// choice through the nested target hash.
+/// choice through the common salted target hash.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeferredReturnSpend;
 
 impl sealed::SettlementMode for DeferredReturnSpend {}
 impl SettlementMode for DeferredReturnSpend {
-    const TAG: &'static [u8] = b"deferred-return-spend/v1";
+    const TAG: &'static [u8] = b"deferred-return-spend/v2";
     const WIRE_ID: u8 = 2;
 }
 

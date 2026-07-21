@@ -14,6 +14,12 @@ rand_core = { workspace = true }
 sha3 = { workspace = true }
 zeroize = { workspace = true }
 
+[features]
+default = ["parallel"]
+# Forwarded to voleith: GGM tree expansion/reconstruction on the rayon
+# pool. Disable for a single-threaded build (identical transcripts).
+parallel = ["voleith/parallel"]
+
 [dev-dependencies]
 criterion = "0.5"
 rand = "0.8"

@@ -35,30 +35,39 @@ impl<P: MayoParams> core::fmt::Debug for RetryRecord<P> {
 /// Response payload durably paired with a consumed nullifier.
 #[derive(Clone, PartialEq, Eq)]
 pub enum RetryResponse {
-    /// A direct fresh-commitment signature.
+    /// A zero-return signature under the common salted wrapper.
     Direct {
         /// MAYO preimage returned to the client.
         signature: Vec<GF16>,
+        /// Uniform signer salt bound into the signed target.
+        salt: [u8; SALT_BYTES],
     },
-    /// A nested fresh-commitment/return signature.
+    /// A fresh-commitment/return signature under the common salted wrapper.
     DeferredReturn {
         /// MAYO preimage returned to the client.
         signature: Vec<GF16>,
         /// Issuer-selected return bound into the signed target.
         return_amount: u64,
+        /// Uniform signer salt bound into the signed target.
+        salt: [u8; SALT_BYTES],
     },
 }
 
 impl Drop for RetryResponse {
     fn drop(&mut self) {
         match self {
-            Self::Direct { signature } => signature.zeroize(),
+            Self::Direct { signature, salt } => {
+                signature.zeroize();
+                salt.zeroize();
+            }
             Self::DeferredReturn {
                 signature,
                 return_amount,
+                salt,
             } => {
                 signature.zeroize();
                 return_amount.zeroize();
+                salt.zeroize();
             }
         }
     }
@@ -91,18 +100,25 @@ impl<P: MayoParams> RetryRecord<P> {
     /// Encode this database record canonically.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
-        let (settlement, signature, return_amount) = match &self.response {
-            RetryResponse::Direct { signature } => (FixedSpend::WIRE_ID, signature, 0),
+        let (settlement, signature, return_amount, salt) = match &self.response {
+            RetryResponse::Direct { signature, salt } => (FixedSpend::WIRE_ID, signature, 0, salt),
             RetryResponse::DeferredReturn {
                 signature,
                 return_amount,
-            } => (DeferredReturnSpend::WIRE_ID, signature, *return_amount),
+                salt,
+            } => (
+                DeferredReturnSpend::WIRE_ID,
+                signature,
+                *return_amount,
+                salt,
+            ),
         };
-        let mut out = Vec::with_capacity(56 + signature.len().div_ceil(2));
+        let mut out = Vec::with_capacity(56 + signature.len().div_ceil(2) + SALT_BYTES);
         wire::header(&mut out, WIRE_RETRY_RECORD, P::WIRE_ID, 0, settlement);
         out.extend_from_slice(&self.request_digest);
         out.extend_from_slice(&wire::pack_nibbles(signature));
         out.extend_from_slice(&return_amount.to_le_bytes());
+        out.extend_from_slice(salt);
         out
     }
 
@@ -126,6 +142,7 @@ impl<P: MayoParams> RetryRecord<P> {
         let request_digest = decoder.array()?;
         let signature = decoder.nibbles(P::KN)?;
         let return_amount = decoder.u64()?;
+        let salt = decoder.array()?;
         decoder.finish()?;
         if !deferred && return_amount != 0 {
             return Err(WireError::InvalidEncoding);
@@ -134,9 +151,10 @@ impl<P: MayoParams> RetryRecord<P> {
             RetryResponse::DeferredReturn {
                 signature,
                 return_amount,
+                salt,
             }
         } else {
-            RetryResponse::Direct { signature }
+            RetryResponse::Direct { signature, salt }
         };
         Ok(Self {
             request_digest,
@@ -154,6 +172,14 @@ impl<P: MayoParams> RetryRecord<P> {
 /// implementation should use a unique nullifier key and return the winning
 /// row from the same transaction. Returning a response before this operation
 /// is durable can create value after a crash and violates the protocol.
+/// Winner selection must depend only on the store's linearization order, not
+/// on candidate contents. Rejected candidates contain secret salts and MAYO
+/// preimages and must not be exposed through logs, telemetry, audit tables, or
+/// any response path. The candidate security theorem additionally needs winner
+/// scheduling independent of candidate-production timing (or external
+/// election/serialization before signing); ordinary first-arrival races leave
+/// a separate leakage proof obligation even when the store never inspects
+/// candidate bytes.
 pub trait NullifierStore<P: MayoParams>: Send {
     /// Look up a previously consumed nullifier.
     fn get(&self, nullifier: &[u8; 32]) -> Result<Option<RetryRecord<P>>, Error>;

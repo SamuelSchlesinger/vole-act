@@ -18,7 +18,7 @@ license = "MIT OR Apache-2.0"
 # Internal crates
 binary-fields = { path = "crates/binary-fields" }
 vector-commit = { path = "crates/vector-commit" }
-voleith = { path = "crates/voleith" }
+voleith = { path = "crates/voleith", default-features = false }
 mayo = { path = "crates/mayo" }
 
 # External

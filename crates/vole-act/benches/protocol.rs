@@ -49,7 +49,7 @@ impl Fixture {
     fn new(profile: PerformanceProfile, seed: u64) -> Self {
         let mut rng = StdRng::seed_from_u64(seed);
         let mut issuer = Issuer::generate_with_store(
-            b"vole-act/criterion/protocol-v1",
+            b"vole-act/criterion/protocol-v2",
             profile,
             NonPersistingBenchmarkStore,
             &mut rng,

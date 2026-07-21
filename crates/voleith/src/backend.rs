@@ -274,7 +274,7 @@ impl Zeroize for ProverConstraint {
 /// Prover-side polynomial expression, coefficients in low-to-high order.
 ///
 /// Stored inline (no heap allocation): the expression layer runs millions of
-/// times per proof. Degrees above [`MAX_DEGREE`] are unsupported — `prove`
+/// times per proof. Degrees above `MAX_DEGREE` are unsupported — `prove`
 /// and `verify` reject such circuits via the counting pass before either
 /// cryptographic backend runs.
 #[derive(Clone, Copy, Debug)]
@@ -728,7 +728,7 @@ pub struct CountingBackend {
     pub max_degree: usize,
     /// Maximum degree of any *constructed* expression, asserted or not.
     /// Proving and verification reject circuits whose built degree exceeds
-    /// [`MAX_DEGREE`] before either cryptographic backend runs, so the
+    /// `MAX_DEGREE` before either cryptographic backend runs, so the
     /// inline-array expression storage can never overflow. This does not
     /// affect `max_degree` and therefore does not change VOLE sizing or the
     /// transcript of any accepted circuit.

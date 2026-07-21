@@ -149,7 +149,7 @@ impl<P: MayoParams> PublicKey<P> {
         effective_balance::<K>(token.base_balance, token.topup).ok_or(Error::InvalidSignature)?;
         let commitment =
             credential_target::<P>(&token.context, &token.key, token.base_balance, &token.nonce);
-        let target = signing_target::<P, K>(&token.context, &commitment, token.topup)
+        let target = signing_target::<P, K>(&commitment, token.topup, &token.salt)
             .ok_or(Error::InvalidSignature)?;
         let evaluated =
             mayo::eval(&self.inner.mayo, &token.signature).map_err(|_| Error::InvalidSignature)?;

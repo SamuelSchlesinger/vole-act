@@ -146,7 +146,7 @@ impl<P: MayoParams, Store: NullifierStore<P>> Issuer<P, Store> {
     }
 
     /// Verify an issuance request for the externally authorized public
-    /// `balance`, then sign its direct credential commitment.
+    /// `balance`, then sign a uniformly salted wrapper around its commitment.
     pub fn issue(
         &self,
         request: &IssueRequest<P>,
@@ -171,16 +171,16 @@ impl<P: MayoParams, Store: NullifierStore<P>> Issuer<P, Store> {
             &request.proof,
         )
         .map_err(proof_error)?;
-        let signature =
-            mayo::spre(&self.secret, &request.commitment, rng).map_err(|_| Error::SigningFailed)?;
+        let (signature, salt) = self.sign_token_target(&request.commitment, 0, rng)?;
         Ok(IssueResponse {
             signature,
+            salt,
             params: PhantomData,
         })
     }
 
-    /// Verify and process an ordinary spend, signing the fresh commitment
-    /// directly. Exact retries return the original response.
+    /// Verify and process an ordinary spend, signing the common salted wrapper
+    /// with a zero return. Exact retries return the original salt and response.
     pub fn spend<K: CredentialKind>(
         &mut self,
         request: &SpendRequest<P, K>,
@@ -193,21 +193,21 @@ impl<P: MayoParams, Store: NullifierStore<P>> Issuer<P, Store> {
         }
 
         self.verify_spend_request(request)?;
-        let signature = mayo::spre(&self.secret, &request.fresh_commitment, rng)
-            .map_err(|_| Error::SigningFailed)?;
+        let (signature, salt) = self.sign_token_target(&request.fresh_commitment, 0, rng)?;
         let candidate = RetryRecord {
             request_digest: digest,
-            response: RetryResponse::Direct { signature },
+            response: RetryResponse::Direct { signature, salt },
             params: PhantomData,
         };
         let stored = self.spent.insert_if_absent(request.nullifier, candidate)?;
         Self::fixed_response(stored, digest)
     }
 
-    /// Verify and process a deferred-return spend. After proof verification,
-    /// the issuer may return `return_amount <= request.maximum_spend()` to the
-    /// fresh token. Exact retries return the originally stored amount and
-    /// signature even if the caller supplies a different amount.
+    /// Verify and process a deferred-return spend. On a first call, the issuer
+    /// supplies `return_amount <= request.maximum_spend()` before verification;
+    /// the bound is checked before the proof, while signing happens only after
+    /// verification succeeds. Exact retries return the originally stored amount
+    /// and signature before considering a newly supplied amount.
     pub fn spend_with_deferred_return<K: CredentialKind>(
         &mut self,
         request: &DeferredReturnSpendRequest<P, K>,
@@ -224,17 +224,14 @@ impl<P: MayoParams, Store: NullifierStore<P>> Issuer<P, Store> {
         }
 
         self.verify_spend_request(request)?;
-        let target = signed_token_target::<P>(
-            &self.public.inner.context,
-            &request.fresh_commitment,
-            return_amount,
-        );
-        let signature = mayo::spre(&self.secret, &target, rng).map_err(|_| Error::SigningFailed)?;
+        let (signature, salt) =
+            self.sign_token_target(&request.fresh_commitment, return_amount, rng)?;
         let candidate = RetryRecord {
             request_digest: digest,
             response: RetryResponse::DeferredReturn {
                 signature,
                 return_amount,
+                salt,
             },
             params: PhantomData,
         };
@@ -250,9 +247,10 @@ impl<P: MayoParams, Store: NullifierStore<P>> Issuer<P, Store> {
             return Err(Error::NullifierAlreadySpent);
         }
         match &stored.response {
-            RetryResponse::Direct { signature } => Ok(TypedSpendResponse {
+            RetryResponse::Direct { signature, salt } => Ok(TypedSpendResponse {
                 signature: signature.clone(),
                 return_amount: 0,
+                salt: *salt,
                 params: PhantomData,
             }),
             RetryResponse::DeferredReturn { .. } => Err(Error::InvalidRequest),
@@ -270,9 +268,11 @@ impl<P: MayoParams, Store: NullifierStore<P>> Issuer<P, Store> {
             RetryResponse::DeferredReturn {
                 signature,
                 return_amount,
+                salt,
             } => Ok(TypedSpendResponse {
                 signature: signature.clone(),
                 return_amount: *return_amount,
+                salt: *salt,
                 params: PhantomData,
             }),
             RetryResponse::Direct { .. } => Err(Error::InvalidRequest),
@@ -287,6 +287,19 @@ impl<P: MayoParams, Store: NullifierStore<P>> Issuer<P, Store> {
             return Err(Error::InvalidRequest);
         }
         Ok(())
+    }
+
+    fn sign_token_target(
+        &self,
+        commitment: &[GF16],
+        topup: u64,
+        rng: &mut impl CryptoRngCore,
+    ) -> Result<(Vec<GF16>, [u8; SALT_BYTES]), Error> {
+        let mut salt = [0u8; SALT_BYTES];
+        rng.fill_bytes(&mut salt);
+        let target = signed_token_target::<P>(commitment, topup, &salt);
+        let signature = mayo::spre(&self.secret, &target, rng).map_err(|_| Error::SigningFailed)?;
+        Ok((signature, salt))
     }
 
     fn verify_spend_request<K: CredentialKind, S: SettlementMode>(

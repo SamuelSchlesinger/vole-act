@@ -74,9 +74,10 @@ impl<P: MayoParams> PendingIssue<P> {
         if request.commitment != self.commitment {
             return Err(Error::InvalidRequest);
         }
+        let target = signed_token_target::<P>(&self.commitment, 0, &response.salt);
         let evaluated = mayo::eval(&public.inner.mayo, &response.signature)
             .map_err(|_| Error::InvalidSignature)?;
-        if evaluated != self.commitment {
+        if evaluated != target {
             return Err(Error::InvalidSignature);
         }
         Ok(Token {
@@ -86,6 +87,7 @@ impl<P: MayoParams> PendingIssue<P> {
             base_balance: self.balance,
             nonce: self.nonce,
             topup: 0,
+            salt: response.salt,
             params: PhantomData,
         })
     }
@@ -144,12 +146,14 @@ impl<P: MayoParams> IssueRequest<P> {
 /// Issuer response completing issuance.
 pub struct IssueResponse<P: MayoParams = Mayo1> {
     pub(super) signature: Vec<GF16>,
+    pub(super) salt: [u8; SALT_BYTES],
     pub(super) params: PhantomData<P>,
 }
 
 impl<P: MayoParams> Drop for IssueResponse<P> {
     fn drop(&mut self) {
         self.signature.zeroize();
+        self.salt.zeroize();
     }
 }
 
@@ -167,6 +171,7 @@ impl<P: MayoParams> Clone for IssueResponse<P> {
     fn clone(&self) -> Self {
         Self {
             signature: self.signature.clone(),
+            salt: self.salt,
             params: PhantomData,
         }
     }
@@ -176,9 +181,10 @@ impl<P: MayoParams> IssueResponse<P> {
     /// Encode this issuance response canonically.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(16 + self.signature.len().div_ceil(2));
+        let mut out = Vec::with_capacity(16 + self.signature.len().div_ceil(2) + SALT_BYTES);
         wire::header(&mut out, WIRE_ISSUE_RESPONSE, P::WIRE_ID, 0, 0);
         out.extend_from_slice(&wire::pack_nibbles(&self.signature));
+        out.extend_from_slice(&self.salt);
         out
     }
 
@@ -186,9 +192,11 @@ impl<P: MayoParams> IssueResponse<P> {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, WireError> {
         let mut decoder = Decoder::new(bytes, WIRE_ISSUE_RESPONSE, P::WIRE_ID, 0, 0)?;
         let signature = decoder.nibbles(P::KN)?;
+        let salt = decoder.array()?;
         decoder.finish()?;
         Ok(Self {
             signature,
+            salt,
             params: PhantomData,
         })
     }

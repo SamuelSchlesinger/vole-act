@@ -1,9 +1,11 @@
 //! Stateful Issue and Spend protocol for post-quantum anonymous credits.
 //!
-//! The core protocol issues direct credentials and keeps ordinary spends on
-//! the two-hash path. The deferred-return extension lets an issuer choose a
-//! bounded return after verifying a spend; its output credential wraps the
-//! fresh commitment and return amount in one additional signed hash.
+//! Every issued credential authenticates a signer-salted wrapper around its
+//! hidden-balance commitment and return amount. Direct credentials use a zero
+//! return; the deferred-return extension lets an issuer choose a bounded
+//! return after the client fixes its proved spend request and before signer
+//! salt generation. This common wrapper keeps the
+//! security argument on fresh, uniformly salted MAYO targets.
 //!
 //! The issuer type includes an in-memory nullifier/retry store so its default
 //! spend operations have the atomic semantics required by the construction:
@@ -13,7 +15,7 @@
 //! the same transaction boundary.
 
 use crate::circuit::{
-    InputCredentialKind, IssueCircuit, MayoTermTable, SpendCircuit, SpendSecrets,
+    InputCredentialKind, IssueCircuit, MayoTermTable, SALT_BYTES, SpendCircuit, SpendSecrets,
     credential_target, derive_nullifier, mayo_terms_and_hash, signed_token_target,
 };
 use crate::wire::{self, Decoder, WireError};
@@ -29,8 +31,8 @@ use voleith::{
 };
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-const ISSUE_STATEMENT: &[u8] = b"VOLE-ACT/issue-statement/v4";
-const SPEND_STATEMENT: &[u8] = b"VOLE-ACT/spend-statement/v4";
+const ISSUE_STATEMENT: &[u8] = b"VOLE-ACT/issue-statement/v5";
+const SPEND_STATEMENT: &[u8] = b"VOLE-ACT/spend-statement/v5";
 
 /// Maximum accepted application-context length in bytes.
 ///
@@ -84,18 +86,14 @@ fn effective_balance<K: CredentialKind>(base_balance: u64, topup: u64) -> Option
 }
 
 fn signing_target<P: MayoParams, K: CredentialKind>(
-    context: &[u8; 32],
     commitment: &[GF16],
     topup: u64,
+    salt: &[u8; SALT_BYTES],
 ) -> Option<Vec<GF16>> {
     if !K::HAS_TOPUP && topup != 0 {
         return None;
     }
-    Some(if K::HAS_TOPUP {
-        signed_token_target::<P>(context, commitment, topup)
-    } else {
-        commitment.to_vec()
-    })
+    Some(signed_token_target::<P>(commitment, topup, salt))
 }
 
 #[cfg(test)]
