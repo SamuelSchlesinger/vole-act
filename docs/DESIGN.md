@@ -1,7 +1,7 @@
 # VOLE-ACT: Post-Quantum Anonymous Credit Tokens
 
-**Protocol version:** 4
-**Wire version:** 1
+**Protocol version:** 5
+**Wire version:** 2
 **Status:** research prototype; implemented and tested, but neither proven nor
 independently audited.
 
@@ -20,8 +20,8 @@ This construction is descended from the Katz–Schlesinger anonymous-credit
 design, but replaces its group signatures and Sigma proofs with a MAYO
 trapdoor relation and a VOLE-in-the-head argument. The optional
 deferred-return operation covers the one case that cannot be represented as an
-ordinary spend: the issuer chooses the final return only after the client has
-committed to its fresh balance.
+ordinary spend: the issuer supplies the final return after the client has
+committed to its fresh balance, but before the signer salt is generated.
 
 ### 1.1 Parties and trust
 
@@ -51,9 +51,12 @@ Setup, Issue, Spend, SpendWithDeferredReturn, VerifyToken.
   input nullifier and returns a direct token of balance
   `balance(token) - s`.
 - `SpendWithDeferredReturn(s, token)` first proves the same maximum deduction
-  `s`. After verification, the issuer chooses `t'` with `0 ≤ t' ≤ s`; the
-  operation consumes the input nullifier and returns a deferred-return token
-  of balance `balance(token) - s + t'`.
+  `s`. The issuer fixes `t'` with `0 ≤ t' ≤ s` before creating the response;
+  on a first call the implementation checks that bound before proof
+  verification and signs only after verification succeeds. The operation
+  consumes the input nullifier and returns a deferred-return token of balance
+  `balance(token) - s + t'`. An exact retry instead replays the stored `t'`
+  before considering the newly supplied value.
 - `VerifyToken` is local client-side authentication of a decoded token. Tokens
   are never sent as presentations; only a zero-knowledge spend request is.
 
@@ -126,33 +129,42 @@ The target and nullifier are disjoint portions of one permutation output. This
 saves a complete hidden SHAKE evaluation while treating the unrevealed suffix
 as pseudorandom after the issuer has seen the prefix.
 
+For every credential, the issuer also samples a fresh 256-bit salt `zeta`
+after accepting the request and defines the common signed target
+
+```text
+S(C,t,zeta) = first 4m bits of SHAKE256(
+  "VOLE-ACT/signed/v3" || pack16(C) || enc64(t) || zeta
+)
+```
+
+The base commitment already binds `ctx`, so the wrapper does not repeat it.
+Even for MAYO5 the encoded message is 129 bytes, below SHAKE256's 136-byte
+rate and within the circuit's single-block absorber.
+
 ### 4.1 Direct credential
 
 ```text
-P(sigma) = C(k,b,rho)
+P(sigma) = S(C(k,b,rho), 0, zeta)
 effective balance = b
-private state = (sigma, k, b, rho)
+private state = (sigma, k, b, rho, zeta)
 ```
 
-Presenting a direct credential requires two hidden SHAKE evaluations: the old
-credential stream and the fresh credential stream.
+Presenting a direct credential requires three hidden SHAKE evaluations: the
+old credential stream, common signed-target wrapper, and fresh credential
+stream.
 
 ### 4.2 Deferred-return credential
 
-For an issuer-selected return `t`, define
-
 ```text
-D(ctx,C,t) = first 4m bits of SHAKE256(
-  "VOLE-ACT/deferred/v2" || ctx || pack16(C) || enc64(t)
-)
-
-P(sigma) = D(ctx, C(k,b,rho), t)
+P(sigma) = S(C(k,b,rho), t, zeta)
 effective balance = b + t
-private state = (sigma, k, b, rho, t)
+private state = (sigma, k, b, rho, t, zeta)
 ```
 
 The addition is exact and non-wrapping. `C`, `b`, and `t` remain hidden during
-presentation. The nested target costs one additional hidden SHAKE.
+presentation. It uses the same common wrapper and circuit shape as a direct
+credential.
 
 The wrapper is essential. Signing an algebraically adjustable value such as
 `H(k||b) + r` would let a holder reopen one signature to unrelated attributes.
@@ -168,7 +180,7 @@ and computes
 
 ```text
 ctx = SHAKE256(
-  "VOLE-ACT/context/v4" ||
+  "VOLE-ACT/context/v5" ||
   frame(app) || H(expanded MAYO public map) || MAYO id ||
   balance width || VOLE tau || VOLE k
 )[0..256].
@@ -185,9 +197,11 @@ To issue public balance `b`:
 1. The client samples `(k,rho)`, computes `C = C(k,b,rho)`, and proves that `C`
    is the output of the credential hash for public `(ctx,b)` and hidden
    `(k,rho)`.
-2. After verifying the proof and external authorization, the issuer samples
-   `sigma <- SPre(sk,C)` and returns `sigma`.
-3. The client checks `P(sigma) = C` and stores a direct token.
+2. After verifying the proof and external authorization, the issuer samples a
+   fresh uniform `zeta`, computes `Y = S(C,0,zeta)`, samples
+   `sigma <- SPre(sk,Y)`, and returns `(zeta,sigma)`.
+3. The client reconstructs `Y`, checks `P(sigma) = Y`, and stores a direct
+   token.
 
 External authorization must itself be one-time. Replaying a payment or grant
 with a fresh commitment legitimately asks the cryptographic issuer for another
@@ -205,48 +219,55 @@ public
 For a direct input, the proof relation is
 
 ```text
-P(sigma) = C(k,b,rho)
+P(sigma) = S(C(k,b,rho), 0, zeta)
 N = N(k,b,rho)
-b' + s = b
+b + 0 = e
+b' + s = e
 C' = C(k',b',rho').
 ```
 
 For a deferred-return input, it is
 
 ```text
-P(sigma) = D(ctx, C(k,b,rho), t)
+P(sigma) = S(C(k,b,rho), t, zeta)
 N = N(k,b,rho)
 b + t = e
 b' + s = e
 C' = C(k',b',rho').
 ```
 
-All additions are exact 64-bit integer relations with a zero final carry. The
-issuer verifies the typed statement, produces `sigma' <- SPre(sk,C')`, and
-atomically associates the exact request digest and response with `N`. The
-client verifies `P(sigma') = C'` and stores a direct token.
+All additions are exact 64-bit integer relations with a zero final carry. For
+a direct input the circuit additionally constrains every bit of `t` to zero;
+otherwise the witness and hash shape are common. The issuer verifies the typed
+statement, samples fresh `zeta'`, produces
+`sigma' <- SPre(sk,S(C',0,zeta'))`, and atomically associates the exact request
+digest, salt, and response with `N`. The client verifies the wrapped target and
+stores a direct token.
 
 Thus an ordinary spend of a deferred-return token folds the old return into
-`b'` and restores the cheaper credential format.
+`b'`. Its output has return zero but uses the same authenticated credential
+format.
 
 ### 5.4 Spend with deferred return
 
 The client proves the same input-possession, nullifier, fresh-commitment, and
 maximum-deduction relation, but the settlement tag is
-`deferred-return-spend/v1`. Only after successful verification does the issuer
-choose `t' ≤ s` and sample
+`deferred-return-spend/v2`. The issuer supplies `t' ≤ s` to the API after the
+client has fixed the request. On a first call the implementation checks the
+bound before proof verification; only after successful verification does it
+sample fresh uniform `zeta'` and sample
 
 ```text
-sigma' <- SPre(sk, D(ctx,C',t')).
+sigma' <- SPre(sk, S(C',t',zeta')).
 ```
 
-The response is `(t',sigma')`. The client checks the public bound, reconstructs
-the target, verifies the preimage, and stores a deferred-return token with
-effective balance `b' + t'`.
+The response is `(t',zeta',sigma')`. The client checks the public bound,
+reconstructs the target, verifies the preimage, and stores a deferred-return
+token with effective balance `b' + t'`.
 
-The proof cost is determined by the input credential. Creating a deferred
-credential from a direct input still proves only two hashes. The third hash is
-paid when that credential is next presented.
+Direct and deferred inputs prove the same three hashes and two additions. The
+direct relation adds only zero constraints for `t`, so their proof payloads are
+identical for a fixed parameter/profile pair.
 
 ### 5.5 Typed state machine
 
@@ -257,9 +278,13 @@ paid when that credential is next presented.
 
 Credential kinds and settlement modes have separate sealed Rust markers.
 Every statement, request digest, and wire envelope also includes both tags.
-Consequently, type erasure or byte-level retagging does not create an implicit
-conversion. A consumed nullifier reused under another tag is a conflicting
-retry.
+Rust types prevent accidental interchange, and unmodified bytes with the wrong
+tag are rejected. The codec header itself is not authenticated: after header
+retagging, structurally identical request, pending-state, response, retry, or
+token bodies may parse under the other mode. End-to-end proof statements and
+request digests reject inconsistent requests and retries. The credential
+relation deliberately quotients zero-return token/response aliases: both views
+have the same authenticated target, nullifier lineage, and effective balance.
 
 `MayoParams` is likewise sealed to the four checked round-2 tuples. A new
 tuple is a protocol revision, not a downstream type implementation: it needs
@@ -271,7 +296,7 @@ identifier, performance limits, and renewed cryptanalysis.
 For each nullifier, the issuer stores
 
 ```text
-(request_digest, response_kind, signature, optional_return).
+(request_digest, response_kind, signature, signer_salt, optional_return).
 ```
 
 `request_digest` covers context, MAYO parameters, input credential kind,
@@ -286,6 +311,24 @@ operation succeeds. Issuer-key restoration requires an explicit recovered
 store; the API provides no empty-store restoration shortcut. Rolling that
 store back to an older snapshot is equivalent to deleting nullifiers and
 violates the protocol contract.
+
+Across replicas, several valid candidates can be computed before one insert
+linearizes. The protocol view exposes only the durable winner. The reduction's
+winner-only coupling requires response-oblivious scheduling because
+first-arrival ordering may depend on secret-dependent completion behavior.
+Merely counting every computed candidate does not simulate that timing trace;
+without this scheduling premise, a separate race-leakage lemma remains open.
+Losing candidates must never reach callers, logs, telemetry, audit tables, or
+operators in either case.
+
+Issuance has no nullifier transaction inside the crate. The surrounding
+service must make authorization, durable charging, idempotency, and first
+client-visible response publication one logical event. An ambiguous delivery
+under the same external idempotency key must replay the durably recorded
+response without signing or charging again. Calling `Issuer::issue` again
+creates another independently salted authenticator, but if it uses the same
+base opening it is still an alternative for one nullifier lineage, not a
+second spendable credit.
 
 ## 6. Circuit and proof system
 
@@ -396,14 +439,31 @@ issuer responses would then require one of:
 1. an accepted false proof or extraction failure;
 2. two relevant openings of a credential hash target;
 3. a collision or domain-confusion failure in transcript/request hashing;
-4. a new MAYO preimage beyond the issuer's authorized preimage samples; or
+4. a MAYO preimage for a fresh random-oracle target not covered by an
+   authorized response; or
 5. a violation of the atomic nullifier-store contract.
 
-Because the issuer samples preimages of targets supplied by protocol
-transcripts, item 4 is a **one-more preimage** assumption for the whipped MAYO
-map on hash-distributed/adaptively selected targets. Ordinary MAYO signature
-EUF-CMA security does not directly imply this property. PoMFRIT makes the same
-distinction in its blind-signature analysis.
+The common salt changes the boundary behind item 4. The message descriptor
+`(C,t)` is fixed before the issuer samples `zeta`: the client fixes `C`, while
+`t=0` is fixed by direct settlement or `t` is issuer-supplied after request
+creation for deferred settlement. Except with negligible guessing,
+`S(C,t,zeta)` is a fresh random-oracle point. This restores the simulation
+direction used by the ordinary MAYO proof: choose a public-map preimage,
+program its image at the fresh salted signing point, and reduce an unsigned
+output through the OV and Multi-Target Whipped MQ games. It avoids granting a
+simulator the trapdoor-inversion oracle built into adaptive one-more security.
+Exact spend retries replay the stored `(zeta,sigma)` pair and never resample
+it. The wrapper is not literally Round-2 `MAYO.Sign`, so its classical-ROM
+game sequence—and especially the sampler rejection loss—must be adapted. A
+paper-level classical ideal-XOF game plan is in
+`research/mayo-assumption-review/reduction/`; its theorem, stateful extraction,
+fixed-Keccak bridge, and QROM treatment remain incomplete and unreviewed.
+The implementation, like Round-2 Algorithm 7, stops after 256 failed sampling
+attempts. Round-2 Lemma 1 bounds rank failure when the key and vinegar sample
+are drawn together. For one generated key reused across attempts it establishes
+`E[p_key] <= B`, not a uniform `p_key <= B`; consequently `B^256` is not a
+justified cap-failure bound without a stronger per-key tail lemma. This is an
+explicit completeness/reduction obligation, not a measured failure.
 
 ### 7.2 Anonymity sketch
 
@@ -420,10 +480,11 @@ occurred. Those values can dominate practical linkability.
 
 ### 7.3 Mode leakage
 
-Direct and deferred inputs have different circuit sizes. Optional use therefore
-partitions the anonymity set when deferred returns are rare. A deployment that
-needs mode hiding should choose one format uniformly for an asset/epoch or use
-the always-wrapped format and accept the third hidden hash.
+Direct and deferred inputs now have the same circuit and proof size. Their
+credential-kind tags are still public inputs to the typed request statement
+and wire envelope, so the API does not itself hide the mode. A future
+mode-hiding API could erase that tag without changing the common credential
+relation.
 
 ### 7.4 Assumptions and non-claims
 
@@ -435,8 +496,9 @@ The intended argument relies on:
   commitment and VOLE conversion;
 - knowledge soundness and zero knowledge of the degree-16 VOLE proof after
   Fiat–Shamir;
-- one-more preimage resistance of the whipped MAYO trapdoor map in the target
-  distribution induced here;
+- the ordinary MAYO foundation—OV indistinguishability plus Multi-Target
+  Whipped MQ—for the fresh random-oracle targets induced by the signer-salted
+  wrapper, with the exact wrapper reduction still to be completed;
 - honest cryptographic randomness and atomic durable nullifier storage.
 
 The implementation does **not** inherit a NIST category from MAYO, does not
@@ -447,13 +509,33 @@ side-channel certification.
 
 ## 8. Canonical encodings and API boundary
 
-Wire version 1 begins every artifact with `VACT || version`, followed by an
+Wire version 2 begins every artifact with `VACT || version`, followed by an
 artifact identifier, MAYO parameter identifier, credential-kind identifier,
 and settlement identifier. Decoders reject wrong types, wrong parameters,
 truncation, nonzero nibble padding, impossible lengths, oversized input, and
 trailing bytes. Proof component counts are capped by protocol maxima before
 allocation. The maximum outer artifact size is 32 MiB; the maximum embedded
 proof is 16 MiB.
+
+The current compatibility matrix is:
+
+| Layer | Current version/domain | Compatibility rule |
+|---|---|---|
+| Outer protocol wire | `2` | wire-v1 artifacts are rejected |
+| Context, statements, request digest | `v5` | earlier transcripts and keys are incompatible |
+| Signed wrapper | `VOLE-ACT/signed/v3` | a 32-byte signer salt is mandatory |
+| Credential and mode markers | `v2` | earlier relations are incompatible |
+| Embedded VOLE proof codec | `1` | independently versioned inside wire-v2 requests |
+
+There is no in-place v1-to-v2 decoder or token upgrader. A deployment must
+either retire the old issuer/key/token population atomically or keep the old
+service and its monotonic nullifier state isolated until every legacy token
+expires. Issuance authorization and idempotency remain a surrounding-service
+transaction: every newly authorized issuance must be durably charged before
+its first client-visible response, while ambiguous delivery under the same
+external idempotency key must replay that response without charging or signing
+again. Repeating `Issuer::issue` blindly produces an alternate authenticator;
+over the same base opening it does not create another spendable lineage.
 
 Canonical codecs cover:
 
@@ -482,19 +564,21 @@ MAYO advanced to NIST's third additional-signature evaluation round in May
 2026, but it is not standardized. Moreover, VOLE-ACT uses its trapdoor in a
 different composition and has no NIST classification.
 
-All built-in VOLE profiles use `tau*k = 128`:
+All built-in VOLE profiles use `tau*k = 128`. Under the signer-salted common
+wrapper, direct and deferred inputs have the same proof payload:
 
 | Profile | `tau` | `k` | Direct-input proof | Deferred-input proof |
 |---|---:|---:|---:|---:|
-| Compact | 16 | 8 | 52,688 bytes | 72,272 bytes |
-| Balanced (default) | 32 | 4 | 101,232 bytes | 140,400 bytes |
-| Low latency | 64 | 2 | 198,320 bytes | 276,656 bytes |
+| Compact | 16 | 8 | 72,784 bytes | 72,784 bytes |
+| Balanced (default) | 32 | 4 | 141,424 bytes | 141,424 bytes |
+| Low latency | 64 | 2 | 278,704 bytes | 278,704 bytes |
 
 Compact minimizes communication but expands 4,096 leaves. Balanced expands
 512. Low latency expands 256 but sends many more correction bits. Run
 `cargo bench -p vole-act --bench protocol` for statistically sampled profile,
 issuer, end-to-end, and wire-codec timings. The ignored release test remains a
-quick one-sample snapshot.
+quick one-sample snapshot. `docs/BENCHMARKS.md` records both the current
+signer-salted measurements and the historical pre-wrapper baseline.
 
 ## 10. Implementation map
 

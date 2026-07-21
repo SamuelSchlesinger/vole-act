@@ -1,15 +1,16 @@
 # VOLE-ACT
 
-VOLE-ACT is a research implementation of post-quantum anonymous credit tokens.
+VOLE-ACT is a research implementation of a post-quantum candidate for
+anonymous credit tokens.
 It combines a MAYO trapdoor map with a VOLE-in-the-head proof of token
 possession, exact balance arithmetic, a one-time nullifier, and a fresh hidden
 balance commitment.
 
-The core operation is deliberately cheap: an ordinary spend consumes either
-credential format and returns a direct credential. A separately typed
-extension lets the issuer choose a bounded return after verifying the proof;
-that extension returns a deferred-return credential and pays for one additional
-hidden SHAKE evaluation when the credential is next presented.
+Every credential authenticates a signer-salted hash of its hidden balance
+commitment and return amount. An ordinary spend uses return zero; a separately
+typed extension lets the issuer supply a bounded return after the client fixes
+its proved request and before signer-salt generation. Both input formats
+therefore use the same three-hidden-SHAKE relation.
 
 This is a cryptographic research prototype. It has not received an independent
 audit, its custom proof composition does not yet have a complete reduction, and
@@ -36,7 +37,7 @@ let response = issuer.spend(&request, &mut rng)?;
 let token = pending.finish(&public, &request, &response)?;
 assert_eq!(token.balance(), 75);
 
-// Direct -> deferred: reserve 35, then return 10 after verification.
+// Direct -> deferred: reserve 35, then let the issuer supply return 10.
 let (pending, request) = token
     .prepare_spend_with_deferred_return(&public, 35, &mut rng)?;
 let response = issuer.spend_with_deferred_return(&request, 10, &mut rng)?;
@@ -60,7 +61,12 @@ The four legal transitions are:
 
 Request, response, pending-state, and token encodings carry explicit version,
 MAYO-parameter, input-kind, and settlement tags. The Rust types and canonical
-wire decoders both reject cross-mode use.
+wire decoders reject unmodified artifacts carrying the wrong tag. The header
+tag is not independently authenticated by the codec, however: retagged bodies
+with identical layouts can parse. Proof statements and request digests provide
+the end-to-end mode binding. Zero-return token and response aliases are
+intentional and fiscally inert because they have the same authenticated target,
+effective balance, and nullifier lineage.
 
 ## Persistence
 
@@ -73,6 +79,14 @@ durable. Restoring an older store snapshot resurrects spent tokens and is a
 protocol failure, so backups and failover also need monotonic/rollback-safe
 recovery.
 
+Multi-replica security requires losing salted credentials to stay out of
+responses, logs, telemetry, and audit tables. The crate tests atomic
+winner/replay behavior. Because first arrival may correlate with a variable
+number of sampler attempts, the current paper-level reduction requires
+response-oblivious winner selection. Merely counting every candidate does not
+yet simulate that timing trace; without such scheduling, a separate
+race-leakage lemma remains open.
+
 Issuer restoration therefore has no empty-store shortcut:
 
 ```text
@@ -84,17 +98,36 @@ keys, issuer keys, proofs, issue/spend messages, client pending states, tokens,
 and retry records. Token, pending-state, response, and issuer-key encodings are
 secret material and need authenticated encryption at rest.
 
+Issuance is deliberately stateless in this crate. A service must bind
+authorization, durable charging, idempotency, and first response publication
+into one logical transaction. An ambiguous retry under the same external
+idempotency key must replay the recorded response without signing or charging
+again. Blindly retrying `Issuer::issue` creates another valid salted
+authenticator; over the same base opening it remains an alternative for one
+nullifier lineage, not another spendable credit.
+
 ## Security boundary
 
-- The MAYO component is used as a trapdoor preimage relation on externally
-  chosen targets. Fiscal soundness therefore needs a one-more-preimage
-  assumption for the MAYO map; ordinary MAYO EUF-CMA security is not the right
-  assumption.
+- The issuer chooses a fresh 256-bit salt only after accepting a request and
+  signs `SHAKE256(commitment || return || salt)`. In the random-oracle model,
+  this restores the ordinary MAYO proof shape: signing points can be
+  programmed from public-map samples, and an unsigned output is handled by
+  the usual OV plus Multi-Target Whipped MQ assumptions rather than a
+  specialized adaptive one-more-preimage assumption. A paper-level game plan
+  for that adaptation is recorded under
+  `research/mayo-assumption-review/reduction/`; completing, formalizing, and
+  independently reviewing it remains an explicit proof obligation.
+- The local MAYO sampler follows Algorithm 7's 256-attempt cap. The published
+  rank-failure bound averages over key generation and a fresh attempt; by
+  itself it does not justify raising that bound to the 256th power for one
+  reused key. A per-key tail/completeness argument remains part of the exact
+  wrapper proof obligation.
 - Four-round Keccak groups have degree 16. The generalized assertion check has
   statistical error at most `17 / 2^128` before computational commitment and
   Fiat-Shamir terms—about 123.9 bits, not a literal 128-bit bound.
-- Optional deferred returns reveal their mode through proof shape and size and
-  can partition the anonymity set.
+- Input-kind tags remain public protocol metadata, but direct and deferred
+  inputs now have the same circuit/proof size; proof length no longer reveals
+  which credential representation was presented.
 - The issuer-side MAYO solver uses a fixed-schedule masked elimination routine,
   and long-lived secret state is zeroized on drop. The complete prover has not
   undergone a constant-time audit.

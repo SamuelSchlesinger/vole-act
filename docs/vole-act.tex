@@ -14,6 +14,7 @@
 \newtheorem{definition}{Definition}
 \newtheorem{assumption}{Assumption}
 \newtheorem{claim}{Claim}
+\newtheorem{lemma}{Lemma}
 \newtheorem{remark}{Remark}
 
 \newcommand{\F}{\mathbb{F}}
@@ -45,12 +46,12 @@ consumes a one-time nullifier and returns a fresh token on the remaining
 balance. Classical constructions rest on discrete-logarithm-style algebra ---
 blind or randomizable signatures, algebraic MACs, Sigma protocols --- none of
 which survives a quantum adversary. We present VOLE-ACT, a post-quantum
-instantiation of the Katz--Schlesinger anonymous-credit design~\cite{KS}
+candidate instantiation of the Katz--Schlesinger anonymous-credit design~\cite{KS}
 whose entire symmetric layer is Keccak and whose only algebraic assumption
 concerns the multivariate-quadratic (whipped MAYO) trapdoor. The central
-idea is to \emph{avoid blindness entirely}: the issuer signs a revealed
-SHAKE256 commitment digest whose preimage stays hidden, and possession of
-the signature is later proven in zero knowledge inside a VOLE-in-the-Head
+idea is to \emph{avoid blindness entirely}: after accepting a revealed
+SHAKE256 commitment digest, the issuer salts and signs a wrapper target;
+possession of the signature is later proven in zero knowledge inside a VOLE-in-the-Head
 proof system that is native to exactly the two ingredients that must be
 proven --- Keccak (a Boolean circuit) and MAYO verification (a quadratic
 system over $\Fsixteen \subseteq \Ftag$). We give syntax and security
@@ -58,11 +59,12 @@ definitions for anonymous credit tokens, the construction --- including a
 degree-16 Keccak checkpointing technique that commits the permutation state
 only every four rounds, and a batched quadratic-system constraint for
 whipped MQ verification --- and a security analysis that states its
-assumptions (an adaptive one-more-preimage property of the whipped map; an
+assumptions (the ordinary MAYO OV and Multi-Target Whipped MQ problems; an
 ideal-XOF model) and its concrete attack ceilings explicitly. A Rust
-research prototype achieves 19--20\,ms proving and 6.5--8\,ms issuer
-verify-and-sign (proof verification plus MAYO preimage sampling) per spend,
-with 52\,KiB proofs and 283-byte tokens.
+research prototype achieves 29--31\,ms client proving per spend across the
+three proof-size profiles and 9.2--9.4\,ms issuer verify-and-sign (proof
+verification plus MAYO preimage sampling) in the Balanced profile, with
+71\,KiB compact-profile proofs and 315-byte tokens.
 \end{abstract}
 
 \section{Introduction}
@@ -98,11 +100,14 @@ over a client-chosen 256-bit nullifier key $\kappa$, public balance $b$, and
 \emph{commitment digest} $\Cred \in \Fsixteen^m$; the next 256 bits form the
 \emph{nullifier} $\Null$. At issuance the client \emph{reveals} $\Cred$ and
 proves in zero knowledge that it is well-formed for the public balance $b$;
-the issuer then computes an ordinary MAYO preimage
-$\sigma \gets \Spre(\mathsf{sk}, \Cred)$ and returns it. Nothing is blind:
-the issuer sees exactly the digest it signs. Unlinkability comes later --- at
+the issuer then chooses a fresh 256-bit salt $\zeta$, computes
+$Y=\shake(\text{``signed''}\|\mathsf{pack16}(\Cred)\|\enc(0)\|\zeta)[0{:}4m]$,
+and returns a MAYO preimage $\sigma \gets \Spre(\mathsf{sk},Y)$ together
+with $\zeta$. Nothing is blind: the issuer sees the commitment it
+authenticates. Unlinkability comes later --- at
 spend time the client proves \emph{in zero knowledge} that it knows
-$(\sigma, \kappa, b, \rho)$ with $P^\ast(\sigma) = \Cred(\kappa,b,\rho)$,
+$(\sigma, \kappa, b, \rho,\zeta)$ with
+$P^\ast(\sigma)=\mathsf{SignedTarget}(\Cred(\kappa,b,\rho),0,\zeta)$,
 revealing only the nullifier $\Null$, the public spend amount, and a fresh
 commitment digest $\Cred'$ for the successor token. The signature and the
 signed digest are never shown again, so there is nothing to link. The
@@ -135,14 +140,14 @@ VOLE-in-the-Head is unusually harmonious on both counts:
 \paragraph{Contributions.}
 (1)~Syntax and game-based security definitions for anonymous credit tokens
 with issuer-settled (\emph{deferred-return}) spends
-(Section~\ref{sec:definitions}), including a candidate semi-formal
-statement of the assumption the issuer's preimage-oracle role forces: an
-adaptive \emph{one-more-preimage} property of the whipped MAYO map.
-(2)~A post-quantum construction from that assumption plus an ideal XOF
+(Section~\ref{sec:definitions}), together with an explicit account of why
+a signer-salted target restores the ordinary MAYO proof strategy and avoids
+an adaptive \emph{one-more-preimage} oracle assumption.
+(2)~A post-quantum candidate construction from the ordinary MAYO foundation plus an ideal XOF
 (Section~\ref{sec:scheme}): one XOF stream yielding both commitment and
 nullifier; a typed two-format token state machine; and a deferred-return
-settlement in which the issuer selects a bounded return only \emph{after}
-verifying the spend proof, bound by a nested hash.
+settlement in which the issuer supplies a bounded return after the client fixes
+its proved request and before signer-salt generation, bound by the common hash.
 (3)~Proof-circuit techniques (Section~\ref{sec:circuit}): \emph{degree-16
 Keccak checkpointing}, committing the permutation state only every four
 rounds and quartering the dominant witness cost by spending the proof
@@ -154,8 +159,9 @@ its conditional status, its concrete error terms, and its generic attack
 ceilings --- including a $2^{256/3}$-query quantum collision bound on the
 credential digest.
 (5)~Evidence of practicality: a Rust research prototype
-(Section~\ref{sec:performance}) with 19--20\,ms spend proving, 6.5--8\,ms
-issuer verify-and-sign, 52\,KiB compact proofs, and 283-byte tokens.
+(Section~\ref{sec:performance}) with 29--31\,ms spend proving across profiles,
+9.2--9.4\,ms Balanced-profile issuer verify-and-sign, 71\,KiB compact proofs,
+and 315-byte tokens.
 
 \section{Preliminaries}
 
@@ -189,7 +195,42 @@ constraint holds; a random linear combination with challenge weights
 $\chi_i$ batches all constraints into one polynomial identity checked at
 $\Delta$. The generalization to degree-$d$ polynomial constraints costs
 $d$ published coefficients and $d-1$ random VOLE masks in total for the whole
-batch.
+batch: mask $j \in \{0,\dots,d-2\}$ is a tag-field VOLE pair contributing
+the degree-1 polynomial $(v_j + u_j\Delta)\,\Delta^{j}$, of degree at most
+$d-1$ in total, so the leading, constraint-carrying coefficient is left
+untouched. Lemma~\ref{lem:mask} makes the masking exact: the published
+vector releases the check equation and nothing else.
+
+\begin{lemma}[Coefficient masking]
+\label{lem:mask}
+Fix $\Delta$ and the mask keys $K_j = v_j + u_j\Delta$ for
+$j \in \{0,\dots,d{-}2\}$ (each mask group packed into one $\Ftag$
+element), and let the honest prover publish
+$c = (c_0,\dots,c_{d-1}) \in \Ftag^{d}$, the coefficient vector of its
+masked response polynomial. Conditioned on the rest of the verifier's
+view, $c$ is uniform on the affine hyperplane
+$\{\,c : \sum_{i<d} c_i \Delta^{i} = A\,\}$, where $A$ is the value the
+verifier computes for the check equation.
+\end{lemma}
+
+\begin{proof}
+The blinds added to the unmasked coefficients are
+$b_0 = v_0$, $b_j = v_j + u_{j-1}$ for $1 \le j \le d-2$, and
+$b_{d-1} = u_{d-2}$. Substituting $v_j = K_j + u_j\Delta$
+(characteristic 2) makes $b$ an affine function of
+$(u_0,\dots,u_{d-2})$, injective by back-substitution: $b_{d-1}$
+determines $u_{d-2}$, then each $b_j$ determines $u_{j-1}$ from $u_j$,
+and $b_0$ is then fixed. Its evaluation is constant:
+$\sum_j b_j \Delta^{j} = \sum_j (v_j + u_j\Delta)\Delta^{j} =
+\sum_j K_j \Delta^{j}$, known to the verifier. So the image is exactly
+the hyperplane $\{\,b : \sum_j b_j\Delta^{j} = \sum_j K_j\Delta^{j}\,\}$
+of size $|\Ftag|^{d-1}$, an injective affine image of
+$(u_0,\dots,u_{d-2}) \in \Ftag^{d-1}$ --- which stays uniform given the
+keys, since each pair $(u_j, v_j)$ is uniform on the line
+$v_j = K_j + u_j\Delta$ --- hence uniform on it; translating
+by the fixed unmasked coefficients preserves uniformity on the shifted
+hyperplane, whose defining value is the check value $A$.
+\end{proof}
 
 VOLE-in-the-Head~\cite{VOLEitH} makes this \emph{publicly verifiable and
 non-interactive}: the prover generates the VOLE correlation itself from
@@ -219,13 +260,43 @@ who mangles one tree's correction data is caught by a per-tree check only
 with probability $1 - 2^{-h}$ --- as low as $3/4$ for $h=2$. The
 construction therefore applies a $128$-row \emph{column-wise linear
 universal hash} to the entire tag matrix (two independent polynomial
-evaluations combined with random weights, plus a one-time-pad block), so that
-any inconsistency survives into the check equation except with probability
-$\approx 2^{-\lambda}$ plus small degree-dependent evaluation terms,
-regardless of the chunk structure (an exact bound is part of the outstanding
-analysis). A scalar hash in place of the matrix hash is a real soundness bug
-we caught during development; we flag it because the failure is silent and
-parameter-dependent.
+evaluations combined with random weights, plus a one-time-pad block), so
+that any inconsistency survives into the check equation except with
+probability at most $2^{-\lambda} + \bigl((L{-}1)/2^{\lambda}\bigr)^{2}$
+per column for $L$ hashed chunks (Lemma~\ref{lem:hash}; $L \approx 186$
+for a direct spend, making the second term $\approx 2^{-241}$),
+regardless of the chunk structure. Composing this per-column bound with
+the challenge schedule and the Fiat--Shamir transform is part of the
+outstanding analysis. A scalar hash in place of the matrix hash is a real
+soundness bug we caught during development; we flag it because the
+failure is silent and parameter-dependent.
+
+\begin{lemma}[Wide-hash universality]
+\label{lem:hash}
+For keys $r_0, r_1, s, t \sample \Ftag$ define
+$H(x_0, x_1) = r_0 P_s(x_0) + r_1 P_t(x_0) + x_1$, where
+$x_0 \in \Ftag^{L}$ is parsed as polynomial coefficients,
+$P_s(x_0) = \sum_{i} x_0[i]\, s^{\,L-1-i}$, and $x_1 \in \Ftag$. For
+every $\delta_0 \ne 0$ and every $c \in \Ftag$,
+\[
+\Pr\bigl[\, r_0 P_s(\delta_0) + r_1 P_t(\delta_0) = c \,\bigr]
+\;\le\; 2^{-\lambda} + \Bigl(\tfrac{L-1}{2^{\lambda}}\Bigr)^{2},
+\]
+so $H$ is $\varepsilon$-almost-universal in its $x_0$ argument with this
+$\varepsilon$; and for uniform $x_1$ the output is uniform, so the pad
+block makes the published hash perfectly hiding.
+\end{lemma}
+
+\begin{proof}
+$P_s(\delta_0)$ is the evaluation at $s$ of a fixed nonzero polynomial of
+degree at most $L-1$, so $\Pr_s[P_s(\delta_0) = 0] \le (L-1)/2^{\lambda}$,
+and independently for $t$. Conditioned on
+$(A, B) = (P_s(\delta_0), P_t(\delta_0)) \ne (0,0)$, the value
+$r_0 A + r_1 B$ is uniform over the choice of the weight multiplying a
+nonzero coordinate, so it hits $c$ with probability $2^{-\lambda}$.
+Adding the probability of the event $(A,B) = (0,0)$ --- in which the
+left side is $0$ and the bound must absorb $c = 0$ --- gives the claim.
+\end{proof}
 
 \subsection{MAYO}
 \label{sec:mayo}
@@ -245,7 +316,12 @@ MAYO$_2$: $(n,m,o,k_w) = (81,64,17,4)$, so $\sigma \in \Fsixteen^{324}$
 (162 bytes) and targets are $m = 64$ nibbles (32 bytes). We note the risk
 posture explicitly: multivariate trapdoors have a difficult history ---
 Rainbow fell to a practical attack in 2022~\cite{Beullens22} --- and MAYO's
-whipping is comparatively young. The design compartmentalizes this risk:
+whipping is comparatively young. The protocol also uses a one-hash,
+signer-salted wrapper rather than MAYO's byte-for-byte message-signing API;
+Remark~\ref{rem:salted} records the resulting reduction boundary. Exact spend
+retries replay one durable response, while repeated authorized issuance
+samples a new salt and hence a new target except on a charged collision. The
+design compartmentalizes this risk:
 a MAYO break forges credentials but is not expected to deanonymize past
 transactions, whose privacy rests only on the hash-based layer
 (Claim~\ref{claim:anon}).
@@ -254,7 +330,11 @@ For the proof circuit, the whipped map is expanded once per public key into
 $m$ upper-triangular forms $G_a \in \Fsixteen^{k_w n \times k_w n}$ with
 $P^\ast(\sigma)_a = \sigma^{\!\top} G_a\, \sigma$; the circuit then proves
 $m$ quadratic equations over the \emph{same} $\binom{k_w n + 1}{2}$ product
-terms (Section~\ref{sec:quadsys}).
+terms (Section~\ref{sec:quadsys}). The $G_a$ table is derived locally and
+never transmitted: at $m \binom{k_w n + 1}{2}$ nibbles --- about
+1.7\,MB for MAYO$_2$, sixteen times the wire-format public key of
+Table~\ref{tab:sizes} --- it is a real cost for constrained verifiers
+(open problem~2 in Section~\ref{sec:open}).
 
 \section{Definitions and assumptions}
 \label{sec:definitions}
@@ -267,7 +347,8 @@ balance-width identifiers are fixed public constants; $\mathsf{KGen}$ is
 MAYO trapdoor generation; $\mathsf{CanonParse}$ is the scheme's canonical
 public-key decoder, returning $\bot$ on any non-canonical encoding; and
 $\mathsf{DeriveCtx}(\mathsf{pk})$ is $\mathsf{Setup}$'s context derivation
-applied to those constants and $\mathsf{pk}$. The maps $\Cred$, $\Def$,
+applied to those constants and $\mathsf{pk}$. The maps $\Cred$,
+$\mathsf{SignedTarget}$,
 $\mathsf{digest}$, and $\mathsf{DeriveCtx}$ are all defined over one
 shared prefix-consistent ideal XOF $\mathcal{H}$
 (Remark~\ref{rem:xof}), which every experiment implicitly samples and
@@ -295,10 +376,12 @@ between an issuer and clients:
   $T$'s nullifier and yields a direct token $T'$ of effective balance
   $\mathsf{bal}(T) - s$, or aborts.
   \item $\mathsf{SpendDeferred}\langle \mathrm{C}(\mathsf{pk}, T, s),
-  \mathrm{I}(\mathsf{sk}, t') \rangle \to T'$: as $\mathsf{Spend}$, except
-  the issuer selects a return $t' \le s$ \emph{after} verifying the
-  client's proof; the output is a \emph{deferred-return token} of effective
-  balance $\mathsf{bal}(T) - s + t'$.
+  \mathrm{I}(\mathsf{sk}) \rangle \to T'$: as $\mathsf{Spend}$, except
+  the issuer selects a return $t' \le s$ (by its return policy, a session
+  input) after the client fixes its proved request and before the signer salt;
+  the output is a
+  \emph{deferred-return token} of effective balance
+  $\mathsf{bal}(T) - s + t'$.
   \item $\mathsf{VerifyToken}(\mathsf{pk}, T) \to \{0,1\}$: local client
   authentication of a decoded token. Tokens are never sent as
   presentations; only spend transcripts are.
@@ -317,7 +400,9 @@ not-yet-spent node, with amounts respecting balances. The scheme is correct
 if, except with negligible probability, no honest operation aborts, every
 client-side authentication check passes, every output balance obeys the
 equations of Definition~\ref{def:syntax}, distinct accepted inputs yield
-distinct nullifiers, and exact retransmission of a \emph{spend} request
+distinct nullifiers (colliding only with probability about
+$q^{2}/2^{257}$ over $q$ accepted credentials, by the birthday bound on
+the 256-bit suffix), and exact retransmission of a \emph{spend} request
 returns the stored response rather than a new node (issuance carries no
 retry cache: an accepted re-issuance resamples the preimage, but the
 opening and nullifier are unchanged, so no new lineage arises).
@@ -396,7 +481,11 @@ is negligible.
 \caption{The fiscal-soundness experiment. Accounting is per logical spend
 event (first durable consumption of a nullifier); letting $\adv$ choose
 $t' \le s$ models issuer return policy conservatively. External redemption
-of value must be idempotent at the same store boundary.}
+of value must be idempotent at the same store boundary; symmetrically,
+since $I$ counts every independently authorized issuance call and issuance
+carries no retry cache, a deployment must replay ambiguous delivery under the
+same external idempotency key rather than re-sign or re-charge --- issuance
+idempotency lives at the payment boundary.}
 \label{fig:fiscal}
 \end{figure}
 
@@ -422,7 +511,12 @@ explicit abort steps (an invalid public key or an invalid challenge
 selection) output a uniformly random bit, so degenerate strategies gain
 nothing; a malformed final guess is likewise replaced by a fresh coin.
 Aborts the adversary induces \emph{inside} protocol sessions are not
-experiment aborts.
+experiment aborts. All handle state ($\mathsf{spent}$, $\mathsf{retired}$,
+$\mathsf{exposed}$) initializes to 0, and $\mathsf{exposed}[h]$ is set as
+soon as a spend \emph{request} on $h$ is delivered to $\adv$, whether or
+not the session completes: a spend request reveals the token's
+deterministic nullifier, so a candidate whose nullifier $\adv$ has already
+seen would be trivially distinguishable.
 $\Pi$ is \emph{spend-anonymous} if for every efficient $\adv$,
 $\mathrm{Adv}^{\mathrm{anon}}_{\Pi,\adv}(\lambda) :=
 \bigl|\Pr[\mathrm{Exp}^{\mathrm{anon}}_{\Pi,\adv}(\lambda) = 1] -
@@ -488,20 +582,19 @@ $\mathrm{Adv}^{\mathrm{anon}}_{\Pi,\adv}(\lambda) :=
    \text{ authenticated} \quad \pccomment{$\mathsf{spent} \Rightarrow
    \mathsf{exposed}$} \\
  \pcind \wedge\; \text{same credential kind} \;\wedge\;
-   \mathsf{bal}(\mathcal{T}[h_0]) = \mathsf{bal}(\mathcal{T}[h_1])
-   \;\wedge\; s \text{ valid for both}}
+   \mathsf{bal}(\mathcal{T}[h_0]) = \mathsf{bal}(\mathcal{T}[h_1]) \\
+ \pcind \wedge\; s \text{ valid for both} \quad \pccomment{implied by
+   equal balances; stated for clarity}}
 \end{pcvstack}
 \caption{The single-challenge spend-anonymity experiment against a
 malicious issuer. The explicit ``abort'' steps (invalid key, invalid
 challenge selection) output a uniformly random bit; an issuer-induced
 abort of the challenge \emph{session} is ordinary protocol behavior ---
 the transcript stands and $\adv$ still guesses, so selective-failure
-strategies remain in scope. All handle state
-($\mathsf{spent}$, $\mathsf{retired}$, $\mathsf{exposed}$) initializes to
-0; $\mathsf{exposed}$ is set as soon as a spend \emph{request} on the
-handle reaches $\adv$, whether or not the session completes --- a spend
-request reveals the token's deterministic nullifier, so a candidate whose
-nullifier $\adv$ has already seen would be trivially distinguishable.}
+strategies remain in scope. Handle-state conventions (initialization and
+the exposure trigger) are part of Definition~\ref{def:anon};
+``authenticated'' in $\mathsf{ValidChallenge}$ is implied by
+storage-on-accept and stated for emphasis.}
 \label{fig:anon}
 \end{figure}
 
@@ -514,24 +607,27 @@ $\beta$ through nullifier reuse (and requiring unexposed candidates
 extends this to nullifiers revealed by \emph{aborted} pre-challenge
 sessions). Retiring the \emph{successor} isolates the definition to a
 single challenged transcript rather than smuggling in a compositional
-guarantee about continued use; for a deferred challenge the issuer's
-adaptive $t'$ choice can make the successor's balance itself
-$\beta$-dependent, so its retirement is also substantively necessary. A chain definition (hidden, permuted token handles
-with identical admissible continuations) is the natural strengthening and
-is left open. Section~\ref{sec:security} discusses the metadata any
+guarantee about continued use. This is scope hygiene, not a defense
+against a known distinguisher: with equal candidate balances the
+successor's balance $\mathsf{bal} - s + t'$ is a deterministic function
+of values $\adv$ already holds --- it chose $t'$ itself, even if as a
+function of the observed nullifier --- so we know of no attack through a
+live successor, and a proof that none exists is exactly the compositional
+statement the stronger definition below would supply. A chain definition
+(hidden, permuted token handles with identical admissible continuations)
+is the natural strengthening and is left open. Section~\ref{sec:security} discusses the metadata any
 deployment leaks outside this game.
 \end{remark}
 
-\begin{assumption}[Adaptive one-more preimage for whipped MAYO]
-\label{ass:omp}
-For an adversary $\adv$ making at most $Q_H$ (classical) queries to the
-ideal XOF $\mathcal{H}$ and at most $Q_S$ calls to $\mathsf{oInv}$, the
-experiment $\mathrm{Exp}^{\mathrm{omp}}_{\adv}(\lambda)$ of
-Figure~\ref{fig:omp} is defined over the two admissible target languages
-the protocol signs. The assumption is that for every efficient $\adv$,
-$\mathrm{Adv}^{\mathrm{omp}}_{\adv}(\lambda) :=
-\Pr[\mathrm{Exp}^{\mathrm{omp}}_{\adv}(\lambda) = 1]$ is negligible (as a
-function of $Q_S$ and $Q_H$).
+\begin{assumption}[Ordinary MAYO foundations]
+\label{ass:mayo}
+The OV problem and Multi-Target Whipped MQ problem of the MAYO Round-2
+specification are hard at the selected parameters.  This is what we mean
+below by ``ordinary MAYO hardness'': OV hides the structured oil subspace,
+while Multi-Target Whipped MQ asks for a preimage of one of many random
+targets under a random whipped map.  The latter is multi-target but gives
+the adversary no trapdoor-inversion oracle, and therefore is strictly
+different from the one-more game in Figure~\ref{fig:omp}.
 \end{assumption}
 
 \begin{figure}[H]
@@ -567,33 +663,67 @@ function of $Q_S$ and $Q_H$).
  \pcreturn 0}
 \end{pchstack}
 \end{pcvstack}
-\caption{The adaptive one-more-preimage experiment. $\mathcal{H}$ is the
-ideal (prefix-consistent) XOF; $\Cred$ and $\Def$ are the credential and
-deferred target maps under their domain tags. Success requires
-$|\mathcal{D}| + 1$ pairwise-distinct admissible targets, where
-$\mathcal{D}$ is the set of \emph{distinct} queried targets; the total
-call budget $Q_S \ge |\mathcal{D}|$ enters only concrete bounds.}
+\caption{The adaptive one-more-preimage experiment required by the prior
+unsalted direct-target design, shown for contrast and \emph{not} assumed by
+the construction below.  The oracle power absent from ordinary MAYO is the
+ability to request trapdoor preimages of adversarially selected admissible
+targets.}
 \label{fig:omp}
 \end{figure}
 
-\begin{remark}[Modeling choices in Assumption~\ref{ass:omp}]
+\begin{remark}[Why the one-more game is stronger]
 \label{rem:omp}
-The opening-accompanied oracle mirrors the protocol, where the issuer
-inverts only targets carrying a verified proof of opening knowledge, and
-\emph{resamples} on repeated requests: only exact spend retransmissions
-are answered from a cache, which the game models as no query at all, and
-preimages the issuer samples but discards after losing an insertion race
-never leave the issuer and are not oracle replies. Counting
-\emph{distinct} targets in the success threshold is essential: charging
-every call would let $r$ resamplings of one target excuse a single forged
-new target, which already violates fiscal soundness. The assumption is
-stronger and less studied than MAYO's signature unforgeability --- the
-issuer here \emph{is} a preimage oracle. PoMFRIT~\cite{PoMFRIT} formalizes
-an $(n,q)$ variant with $n$ \emph{random} targets, at most $q$ inversion
-calls, and $q+1$ distinct target indices for success; bridging that game
-to the adaptive, opening-accompanied, two-language version above (and
-stating a QROM variant with quantum XOF access) is part of the outstanding
-analysis, not a citation we inherit.
+The prior design passed a client-derived target directly to $\Spre$.  A
+simulator that chose a public preimage $\sigma$ could evaluate
+$P^\ast(\sigma)$, but could not force that image to equal the already fixed
+client target; Figure~\ref{fig:omp}'s inversion oracle supplied exactly the
+missing power.  Merely proving that the client evaluated Keccak does not
+change this direction of simulation.  PoMFRIT's optimized construction uses
+an $(n,q)$ one-more assumption for this reason.  Its more general
+hash-and-prove construction instead relies on ordinary MAYO security.
+\end{remark}
+
+\begin{remark}[Signer-salted wrapper and proof boundary]
+\label{rem:salted}
+The construction removes the problematic client-fixed-target interface and
+same-target multiplicity constructively: the issuer signs only salted wrappers
+\[
+y \;=\; \mathcal{H}\bigl(\text{``signed''} \,\|\,
+\mathsf{pack16}(\Cred) \,\|\, \enc(t) \,\|\, \zeta\bigr)[0:4m],
+\qquad \zeta \sample \{0,1\}^{256}
+\]
+freshly after each request is accepted (with $t=0$ for the direct format).
+The token stores $\zeta$, and the spend relation proves the wrapper with
+$\zeta$ hidden.  Except for salt prediction/collision, the XOF point is fresh,
+so the ordinary MAYO simulation can choose $\sigma$, compute
+$P^\ast(\sigma)$, and program that value at the salted point.  An unsigned
+output can then feed the OV and Multi-Target Whipped MQ hops.  Exact spend
+retries replay the durable $(\zeta,\sigma)$ pair and do not create another
+signing sample.
+
+This is the ordinary MAYO \emph{proof shape}, not a verbatim invocation of
+Round-2 Theorem~1: the wrapper encoding and salt derivation differ from
+Algorithm~7.  An adapted classical-ROM proof must couple trapdoor sampling
+to public sampling, paying the published rank-rejection factor
+$(1-Q_{\mathsf{cpl}} B)^{-1}$ when $Q_{\mathsf{cpl}} B<1$, plus salt-prequery, collision, and local
+sampler-failure terms.  For MAYO$_2$, $B\approx2^{-20}$, so even the
+published proof has a per-key query boundary near $2^{19}$ signatures for a
+constant-factor loss.  The 256-attempt implementation cap needs a distinct
+argument: Lemma~1 averages the rank-failure probability over key generation
+and a fresh vinegar sample, giving $\mathbb{E}[p_{\mathsf{key}}]\le B$, not a
+uniform per-key $p_{\mathsf{key}}\le B$.  It therefore does not by itself
+justify a $B^{256}$ cap-failure term for one reused key.  A stronger tail or
+key-validation argument remains open. If $Q_{\mathsf{try}}$ is a hard
+experiment-level maximum on sampler invocations (each containing at most 256
+rank attempts), the cited lemma alone gives only the conservative cap term
+$Q_{\mathsf{try}}B$. The coupling uses $Q_{\mathsf{cpl}}=Q_S$ only under
+response-oblivious race linearization and confidentiality of losing
+candidates. Merely replacing $Q_S$ by $Q_{\mathsf{try}}$ does not simulate a
+winner selected through variable sampler timing; without the scheduling
+premise, a separate race-leakage lemma remains open. A QROM treatment also
+remains open. Omitting $\ctx$
+from the outer encoding saves a rate block; $\Cred$ already commits it, and
+one MAYO key is confined to one derived context.
 \end{remark}
 
 \begin{remark}[Hash modeling and adversary class]
@@ -639,23 +769,27 @@ signing time); the nullifier suffix $\Null$ is revealed exactly once (at
 spending time). Under the ideal-XOF modeling, the suffix is pseudorandom
 given the prefix, which is what divorces the spend from the issuance.
 
-\subsection{Two token formats and the settlement state machine}
+\subsection{One authenticated format, two typed settlement states}
 
-A \emph{direct} token is $(\sigma, \kappa, b, \rho)$ with
-$P^\ast(\sigma) = \Cred(\kappa,b,\rho)$ and effective balance $b$. A
-\emph{deferred-return} token additionally carries an issuer-chosen return
-$t$, with
+Every token is $(\sigma,\kappa,b,\rho,t,\zeta)$, where $\zeta$ is a
+uniform 256-bit signer salt and
 \[
-P^\ast(\sigma) \;=\; \Def\bigl(\ctx, \Cred(\kappa,b,\rho), t\bigr)
-\;=\; \shake\bigl(\text{``deferred''} \,\|\, \ctx \,\|\,
-\mathsf{pack16}(\Cred) \,\|\, \enc(t)\bigr)[0:4m],
+\begin{aligned}
+P^\ast(\sigma) &\;=\;
+\mathsf{SignedTarget}(\Cred(\kappa,b,\rho),t,\zeta), \\
+\mathsf{SignedTarget}(\Cred,t,\zeta)
+&\;=\; \shake\bigl(\text{``signed''} \,\|\,
+\mathsf{pack16}(\Cred) \,\|\, \enc(t) \,\|\, \zeta\bigr)[0:4m].
+\end{aligned}
 \]
-and effective balance $b + t$ (exact, non-wrapping). (The formal tuples
-elide fixed metadata the implementation stores and
-$\mathsf{VerifyToken}$ checks: the derived context, the credential-kind
-tag, and the direct format's structurally zero top-up.) The nested hash
-gives a
-simple, domain-separated binding of both the base commitment and the return:
+Its effective balance is $b+t$ (exact, non-wrapping).  A \emph{direct}
+token constrains $t=0$; a \emph{deferred-return} token carries an
+issuer-chosen $t$. (The formal tuple elides fixed metadata the implementation
+stores and $\mathsf{VerifyToken}$ checks: the derived context and
+local credential-kind marker.) At $t=0$ the two markers intentionally name the
+same semantic credential: retagging that token does not create a new
+nullifier lineage or effective balance. The common hash gives a simple binding of the base
+commitment, return, and signer salt:
 changing $t$ requires a fresh preimage or a target collision, and no
 algebraic combiner (such as $\Cred + \iota(t)$) has to be analyzed for
 malleability at all.
@@ -665,9 +799,17 @@ always outputs a direct token; $\mathsf{SpendDeferred}$ consumes
 either format and outputs a deferred-return token. The client commits to a
 fresh $(\kappa', \rho', b')$ \emph{before} the issuer chooses $t' \le s$, which is
 precisely the case that cannot be expressed as a smaller net spend --- if the
-return were known in advance, the client would simply spend less. All four
-transitions carry distinct domain-separation tags end-to-end, so mode
-confusion at the byte level cannot create an untyped path.
+return were known in advance, the client would simply spend less. Requests,
+proof statements, pending states, settlement responses, and retry records
+carry distinct mode tags, but the wire header is not itself an authenticator:
+retagged identical-layout bodies can parse. Proof statements and request
+digests supply end-to-end mode binding. Zero-return token and response aliases
+are deliberate and fiscally inert. A spend of
+amount $s = 0$ is deliberately admissible: it consumes the old nullifier
+and rotates $(\kappa, \rho)$, an unlinkable \emph{refresh} of an
+unchanged balance --- useful, for example, after suspected exposure of
+client state. (Each refresh writes a durable nullifier record at zero
+redeemed value, so deployments should rate-limit or price it.)
 
 \subsection{Proof relations}
 \label{sec:relation}
@@ -690,13 +832,12 @@ low nibble):
 \pchspace
 \procedure{$\mathsf{Target}(T)$}{%
  (\Cred, \_) \gets \mathsf{CredStream}_{\ctx_T}(\kappa_T, b_T, \rho_T) \\
- \pcif \mathsf{kind}(T) = \mathsf{Direct}: \pcreturn \Cred \\
- \pcreturn \mathsf{DefTarget}_{\ctx_T}(\Cred, t_T)}
+ \pcreturn \mathsf{SignedTarget}(\Cred, t_T, \zeta_T)}
 \end{pchstack}
 \pcvspace
-\procedure{$\mathsf{DefTarget}_{\ctx}(\Cred, t)$}{%
- \pcreturn \mathcal{H}(\text{``deferred''} \,\|\, \ctx \,\|\,
-   \mathsf{pack16}(\Cred) \,\|\, \enc(t))[0{:}4m]}
+\procedure{$\mathsf{SignedTarget}(\Cred, t, \zeta)$}{%
+ \pcreturn \mathcal{H}(\text{``signed''} \,\|\,
+   \mathsf{pack16}(\Cred) \,\|\, \enc(t) \,\|\, \zeta)[0{:}4m]}
 \pcvspace
 \procedure{$\mathsf{VerifyToken}(\mathsf{pk}, T)$}{%
  \pcif \ctx_T \ne \mathsf{DeriveCtx}(\mathsf{pk}): \pcreturn 0 \\
@@ -705,9 +846,13 @@ low nibble):
  \pcreturn [P^\ast(\sigma_T) = \mathsf{Target}(T)]}
 \end{pcvstack}
 \caption{Helper maps and local token authentication. A token carries the
-tuple $(\mathsf{kind}, \sigma, \kappa, b, \rho, t)$, with $t = 0$ for the
+tuple $(\mathsf{kind}, \sigma, \kappa, b, \rho, t,\zeta)$, with $t = 0$ for the
 direct format, together with its stored context $\ctx_T$; the effective
-balance is $\mathsf{bal}(T) = b_T + t_T$.}
+balance is $\mathsf{bal}(T) = b_T + t_T$. The maps are written
+recomputing $\mathsf{CredStream}$ throughout; implementations cache the
+derived commitment, but a token \emph{stores} none --- $\Cred$ is always
+recomputed from the opening, so no stale commitment/opening mismatch can
+arise.}
 \label{fig:helpers}
 \end{figure}
 
@@ -722,22 +867,27 @@ conservation, and well-formedness of the fresh commitment:
  \,\bigr\} \\[0.4em]
 \mathcal{R}_{\mathsf{spend}}^{\mathsf{Dir}} = \bigl\{\,
  &(\ctx, s, \Null, \Cred');\;
-   (\sigma, \kappa, b, \rho, \kappa', b', \rho') \;: \\
+   (\sigma, \kappa, b, \rho, t,\zeta,e, \kappa', b', \rho') \;: \\
  &(\Cred, \Null) = \mathsf{CredStream}_{\ctx}(\kappa, b, \rho)
- \;\wedge\; P^\ast(\sigma) = \Cred \\
- &\wedge\; b' + s = b \text{ exactly (no 64-bit wrap)}
- \;\wedge\; (\Cred', \cdot) =
+ \;\wedge\; t=0
+ \;\wedge\; P^\ast(\sigma) = \mathsf{SignedTarget}(\Cred,t,\zeta) \\
+ &\wedge\; b+t=e \;\wedge\; b' + s = e
+   \text{ exactly (no 64-bit wrap)} \\
+ &\wedge\; (\Cred', \cdot) =
    \mathsf{CredStream}_{\ctx}(\kappa', b', \rho')
- \,\bigr\} \\[0.4em]
+ \\[-0.2em]
+ &\,\bigr\} \\[0.4em]
 \mathcal{R}_{\mathsf{spend}}^{\mathsf{Def}} = \bigl\{\,
  &(\ctx, s, \Null, \Cred');\;
-   (\sigma, \kappa, b, \rho, t, \kappa', b', \rho') \;: \\
+   (\sigma, \kappa, b, \rho, t,\zeta,e, \kappa', b', \rho') \;: \\
  &(\Cred, \Null) = \mathsf{CredStream}_{\ctx}(\kappa, b, \rho)
- \;\wedge\; P^\ast(\sigma) = \mathsf{DefTarget}_{\ctx}(\Cred, t) \\
- &\wedge\; b + t = b' + s \text{ exactly (both sums below } 2^{64})
- \;\wedge\; (\Cred', \cdot) =
+ \;\wedge\; P^\ast(\sigma) = \mathsf{SignedTarget}(\Cred,t,\zeta) \\
+ &\wedge\; b+t=e \;\wedge\; b' + s=e
+   \text{ exactly (both sums below } 2^{64}) \\
+ &\wedge\; (\Cred', \cdot) =
    \mathsf{CredStream}_{\ctx}(\kappa', b', \rho')
- \,\bigr\}
+ \\[-0.2em]
+ &\,\bigr\}
 \end{align*}
 The balance equations are exact 64-bit unsigned additions with zero final
 carry, proven over committed carry bits: there is no modular wraparound to
@@ -791,12 +941,15 @@ interfaces. $\mathsf{digest}(\ctx, \mathit{req}) =
  \pccomment{session input, not in the request} \\
  \text{require } \Pi.\mathsf{Verify}(\mathcal{R}_{\mathsf{issue}},
    (\ctx, b, \Cred), \pi) \\
- \pcreturn \sigma \sample \Spre(\mathsf{sk}, \Cred)}
+ \zeta \sample \{0,1\}^{256}; \quad
+ Y \gets \mathsf{SignedTarget}(\Cred,0,\zeta); \quad
+ \sigma \sample \Spre(\mathsf{sk},Y) \\
+ \pcreturn (\zeta,\sigma)}
 \end{pchstack}
 \pcvspace
-\procedure{$\mathsf{Issue.Finish}(\mathsf{pk}, \mathit{st}, \sigma)$}{%
- \text{require } P^\ast(\sigma) = \Cred; \quad
- \pcreturn T = (\mathsf{Direct}, \sigma, \kappa, b, \rho, t{=}0)}
+\procedure{$\mathsf{Issue.Finish}(\mathsf{pk}, \mathit{st}, (\zeta,\sigma))$}{%
+ \text{require } P^\ast(\sigma) = \mathsf{SignedTarget}(\Cred,0,\zeta) \\
+ \pcreturn T = (\mathsf{Direct}, \sigma, \kappa, b, \rho, t{=}0,\zeta)}
 \end{pcvstack}
 \caption{Setup and issuance.}
 \label{fig:issue-alg}
@@ -814,10 +967,9 @@ interfaces. $\mathsf{digest}(\ctx, \mathit{req}) =
    \quad
  (\_, \Null) \gets \mathsf{CredStream}_{\ctx}(\kappa_T, b_T, \rho_T) \\
  x \gets (\ctx, \mathsf{kind}(T), \mathsf{mode}, s, \Null, \Cred') \\
- \pcif \mathsf{kind}(T) = \mathsf{Direct}: \quad
-   w \gets (\sigma_T, \kappa_T, b_T, \rho_T, \kappa', b', \rho') \\
- \pcelse: \quad
-   w \gets (\sigma_T, \kappa_T, b_T, \rho_T, t_T, \kappa', b', \rho') \\
+ e_T \gets b_T+t_T; \quad
+ w \gets (\sigma_T, \kappa_T, b_T, \rho_T, t_T,\zeta_T,e_T,
+   \kappa', b', \rho') \\
  \pi \sample \Pi.\mathsf{Prove}(
    \mathcal{R}_{\mathsf{spend}}^{\mathsf{kind}(T)}, x, w) \\
  \pcreturn (\mathit{req} = (\mathsf{kind}(T), \mathsf{mode}, s, \Null,
@@ -832,15 +984,16 @@ interfaces. $\mathsf{digest}(\ctx, \mathit{req}) =
    \mathit{dig}' = \mathit{dig} \text{ else } \bot \\
  x \gets (\ctx, \mathit{req}.\mathsf{kind}, \mathit{req}.\mathsf{mode},
    \mathit{req}.s, \mathit{req}.\Null, \mathit{req}.\Cred') \\
+ \pcif \mathit{req}.\mathsf{mode} = \mathsf{Spend}: \quad t' \gets 0 \\
+ \pcelse: \quad t' \gets \mathsf{policy}(\mathit{req}) \text{ with }
+   0 \le t' \le \mathit{req}.s \\
  \text{require } \Pi.\mathsf{Verify}(
    \mathcal{R}_{\mathsf{spend}}^{\mathit{req}.\mathsf{kind}}, x,
    \mathit{req}.\pi) \\
- \pcif \mathit{req}.\mathsf{mode} = \mathsf{Spend}: \quad
-   \mathit{resp} \gets \Spre(\mathsf{sk}, \mathit{req}.\Cred') \\
- \pcelse: \quad t' \gets \mathsf{policy}(\mathit{req}) \text{ with }
-   0 \le t' \le \mathit{req}.s; \quad
-   \mathit{resp} \gets (t', \Spre(\mathsf{sk},
-   \mathsf{DefTarget}_{\ctx}(\mathit{req}.\Cred', t'))) \\
+ \zeta' \sample \{0,1\}^{256}; \quad
+ Y' \gets \mathsf{SignedTarget}(\mathit{req}.\Cred',t',\zeta'); \quad
+ \sigma' \sample \Spre(\mathsf{sk},Y') \\
+ \mathit{resp} \gets (t',\zeta',\sigma') \\
  \text{\emph{atomically} insert } \mathsf{St}[\mathit{req}.\Null] \gets
    (\mathit{dig}, \mathit{resp});
    \text{ let } (\mathit{dig}^\ast, \mathit{resp}^\ast)
@@ -850,14 +1003,14 @@ interfaces. $\mathsf{digest}(\ctx, \mathit{req}) =
 \pcvspace
 \procedure{$\mathsf{Spend.Finish}(\mathsf{pk}, \mathit{st},
   \mathit{resp})$}{%
+ (t',\zeta',\sigma') \gets \mathit{resp}; \quad
+ \text{require } P^\ast(\sigma')=
+   \mathsf{SignedTarget}(\Cred',t',\zeta') \\
  \pcif \mathit{st}.\mathsf{mode} = \mathsf{Spend}: \quad
-   \sigma' \gets \mathit{resp};
-   \text{ require } P^\ast(\sigma') = \Cred';
-   \pcreturn (\mathsf{Direct}, \sigma', \kappa', b', \rho', 0) \\
- (t', \sigma') \gets \mathit{resp};
-   \text{ require } t' \le \mathit{st}.s \wedge
-   P^\ast(\sigma') = \mathsf{DefTarget}_{\ctx}(\Cred', t') \\
- \pcreturn (\mathsf{Deferred}, \sigma', \kappa', b', \rho', t')}
+   \text{require }t'=0; \quad
+   \pcreturn (\mathsf{Direct}, \sigma', \kappa', b', \rho', 0,\zeta') \\
+ \text{require } t' \le \mathit{st}.s; \quad
+ \pcreturn (\mathsf{Deferred}, \sigma', \kappa', b', \rho', t',\zeta')}
 \end{pcvstack}
 \caption{Spending, both settlement modes. $\mathsf{policy}$ is the
 issuer's return-selection function; the durable-record comparison
@@ -869,16 +1022,16 @@ concurrent insertion.}
 The client-side requirement $\mathsf{VerifyToken}$ and the finish-time
 checks are the complete authentication surface the anonymity game relies
 on. An ordinary spend of a deferred-return token folds the old return
-into $b'$ and restores the cheaper direct format; the issuer verifies,
+into $b'$ and emits the common format with $t'=0$; the issuer verifies,
 signs, and durably stores the response under $\Null$, so exact
 retransmissions replay and a network failure cannot burn a balance.
 
 \section{The proof circuit}
 \label{sec:circuit}
 
-The relation above is almost entirely SHAKE256: a direct-input spend proves
-two hidden sponge evaluations (old stream, fresh stream), a deferred-input
-spend proves three (the nested target costs one more). Everything else ---
+The relation above is almost entirely SHAKE256: every spend proves three
+hidden sponge evaluations (old stream, signed wrapper, fresh stream).
+Everything else ---
 the MAYO equation and the balance arithmetic --- is quadratic. This section
 describes the three techniques that make the circuit small.
 
@@ -901,11 +1054,15 @@ constraint asserts (per bit) that the degree-16 expression equals the next
 committed state --- a degree-16 polynomial constraint, the largest the
 instantiation accepts. This quarters the per-permutation witness from
 $24 \times 1600$ to $6 \times 1600 = 9600$ bits. One permutation dominates
-each hidden SHAKE evaluation, so a direct spend's witness is
-$21{,}712$ bits and a deferred spend's $31{,}504$ --- versus roughly
-$79{,}300$ and $117{,}900$ under per-round checkpointing. The prover-side
-cost is the coefficient-vector products of the expression layer, about
-$1.14$ million $\Ftag$ multiplications per permutation.
+each hidden SHAKE evaluation, so both spend witnesses are $31{,}760$ bits
+for MAYO$_2$ --- versus roughly $118{,}200$ under per-round
+checkpointing. The cost is
+the coefficient-vector products of the expression layer, about
+$1.14$ million $\Ftag$ multiplications per permutation --- and the
+\emph{verifier} pays the same evaluation over its keys: measured on the
+prototype, this expression layer is the dominant term of issuer
+verification, ahead of the quadratic-system folds and the seed-tree
+reconstruction (Section~\ref{sec:performance}).
 
 \subsection{The quadratic-system constraint for MAYO}
 \label{sec:quadsys}
@@ -949,31 +1106,47 @@ govern.
 \begin{claim}[Fiscal soundness, conditional]
 \label{claim:fiscal}
 In the ideal-XOF model of Remark~\ref{rem:xof}, under
-Assumption~\ref{ass:omp}, adaptive multi-theorem knowledge soundness
-(extractability) of the VOLEitH argument for \emph{both} the issuance and
-the spend relations, and a linearizable, non-rollback nullifier store,
-VOLE-ACT satisfies Definition~\ref{def:fiscal}.
+Assumption~\ref{ass:mayo} and the signer-salted wrapper reduction sketched in
+Remark~\ref{rem:salted}, adaptive multi-theorem \emph{straight-line}
+knowledge soundness (online extractability from the random-oracle
+transcript, without rewinding, at proof acceptance and before current-output
+signing) of the VOLEitH argument for \emph{both}
+the issuance and the spend relations, a linearizable, non-rollback nullifier
+store with confidential race losers and response-oblivious winner selection,
+and service-level atomic issuance authorization, charging, idempotent durable
+recording, and first publication, VOLE-ACT satisfies
+Definition~\ref{def:fiscal}.
 \end{claim}
 
 \noindent\emph{Discussion and error terms.}
 Conditionally on extraction, every accepted operation yields an opening
 and a MAYO preimage for an admissible target, correct nullifier
-derivation, and exact balance arithmetic; over-redemption then requires
-either one more admissible preimage than the issuer produced
-(Assumption~\ref{ass:omp}) or a \emph{target collision}. The collision
-cases are: two credential-stream openings with equal $\Cred$; two
-deferred wrappers with equal $\Def$ output; and a cross-domain collision
-$\Cred = \Def(\cdot)$ --- the domain tags separate the hash inputs, but
-all three remain generic collision events in the same $4m$-bit output
-space and must be counted. A fourth, operational collision event: the
+derivation, and exact balance arithmetic.  Nullifier-class accounting turns
+over-redemption, outside collision and store failures, into an EUF-CMA
+forgery for the common salted wrapper: an authenticated message descriptor
+$(\Cred,t)$ not previously submitted to the wrapper signer. The reduction
+halts on the first such extracted input before signing the current output, so
+no current or later query can retroactively submit that message. Remark~\ref{rem:salted}
+sketches how the ordinary MAYO simulation handles this forgery without a
+one-more oracle. Two credential-stream openings with equal $\Cred$ are a bad
+event in the fiscal-to-unsigned-message lift. A collision between an unsigned
+wrapper input and a programmed signing target need not be a separate abort in
+the later MTWMQ game: the transferred preimage itself solves that random
+target. It still exposes the generic ceiling of the same $4m$-bit output
+space, and a finished advantage statement must place the event explicitly.
+A further operational collision event: the
 retry store retains a 256-bit \emph{request digest} rather than the full
 request, so exact-retry semantics additionally assume collision
 resistance of that digest (or full-request comparison), and the redeemed
 service itself --- not merely the token response --- must be tied
-idempotently to the first durable record. Issuance soundness matters because
-Assumption~\ref{ass:omp} feeds the oracle only opening-accompanied
-targets: without it, a malicious issuance request could obtain a preimage
-for an unopened target. The dominant known terms and generic ceilings
+idempotently to the first durable record. Nullifier collisions, by
+contrast, need no fiscal accounting: two distinct accepted credentials
+with colliding $\Null$ only make the store refuse whichever spends
+second --- a liveness failure charged to correctness
+(Definition~\ref{def:correctness}), never extra value. Issuance soundness
+matters because it ties every signed wrapper message to an extracted opening;
+without it, a malicious issuance request could obtain a signature on an
+unaccounted descriptor. The dominant known terms and generic ceilings
 include (this is not yet a complete advantage expression --- proof-attempt
 counts, $Q_H$ factors, vector-commitment and consistency terms, and
 composition loss are unquantified):
@@ -988,9 +1161,14 @@ composition loss are unquantified):
   double-spending, and with distinct balances creating value. This is
   generic collision search: about $2^{128}$ classically, and query
   complexity $\Theta(2^{256/3}) \approx 2^{85.3}$ for an ideal quantum
-  collision adversary~\cite{BHT} (under BHT's demanding memory model).
+  collision adversary (upper bound from BHT~\cite{BHT}, under its
+  demanding memory model; matching query lower bound from
+  Aaronson--Shi~\cite{AaronsonShi}).
   Deployments requiring a larger quantum collision margin need a wider
-  digest, hence a larger $m$.
+  digest, hence a larger $m$. Any concrete birthday term must count all
+  distinct credential-XOF inputs, including adversarial offline grinding as
+  well as honest and extracted openings; it cannot count only the two inputs
+  appearing in the final collision.
 \end{itemize}
 Honest double spends are prevented operationally: a repeated credential
 reveals the same deterministic nullifier, whose conflicting reuse the
@@ -1001,18 +1179,24 @@ retransmission safe.
 \begin{claim}[Spend anonymity, conditional]
 \label{claim:anon}
 In the ideal-XOF model of Remark~\ref{rem:xof}, assuming the VOLEitH
-argument is adaptive multi-theorem non-interactive zero knowledge for the
-chosen-key relation (i.e., against maliciously formed but canonically
-parsed public keys, in the ROM), VOLE-ACT satisfies
+argument is adaptive multi-theorem non-interactive zero knowledge for all
+three chosen-key relations $\mathcal{R}_{\mathsf{issue}}$,
+$\mathcal{R}_{\mathsf{spend}}^{\mathsf{Dir}}$, and
+$\mathcal{R}_{\mathsf{spend}}^{\mathsf{Def}}$ (i.e., against maliciously
+formed but canonically parsed public keys, in the ROM), VOLE-ACT satisfies
 Definition~\ref{def:anon}; the claim does not depend on any MAYO
 assumption.
 \end{claim}
 
 \noindent\emph{Discussion.}
 A spend reveals $(s, \Null, \Cred', \text{proof})$. The intended argument:
-the compiled argument is NIZK zero-knowledge in the sense above (the
-$2\lambda$-bit per-proof salt is multi-instance \emph{hardening}, not by
-itself a theorem upgrading honest-verifier ZK to this property); $\Cred'$
+the compiled argument is NIZK zero-knowledge for all three relations in
+the sense above (the $2\lambda$-bit per-proof salt is multi-instance
+\emph{hardening}, not by itself a theorem upgrading honest-verifier ZK to
+this property) --- zero knowledge of the \emph{issuance} proof is as
+load-bearing as that of the spend proofs, since it argues about the very
+stream whose unrevealed suffix is the nullifier, and a leaky issuance
+proof would link the later spend with no MAYO involvement; $\Cred'$
 hides its opening under the fresh 256-bit nonce $\rho'$; and $\Null$ is
 the unrevealed suffix of an XOF stream whose prefix the issuer saw at
 issuance, pseudorandom given the prefix in the ideal-XOF model. None of
@@ -1021,18 +1205,35 @@ the claim is conditional on all three. Its MAYO-independence is the design's com
 trapdoor recovery or forgery does not help the distinguisher in
 Definition~\ref{def:anon}. Outside the game, deployments leak metadata the
 definition deliberately excludes: spend amounts are public; direct-input
-and deferred-input proofs differ substantially in size and partition the
-anonymity set, as do credential kind, settlement mode, request length,
-timing, network identity, and retry behavior.
+and deferred-input proofs now have the same circuit and byte size, but the
+explicit credential-kind and settlement tags, timing, network identity, and
+retry behavior remain visible. Two further channels
+deserve explicit flags. The definition hands every session one
+$\mathsf{pk}$, so key \emph{consistency} is assumed, not provided: a
+malicious issuer serving different (individually canonical) keys to
+different clients partitions the anonymity set completely, since each
+spend verifies under exactly one derived $\ctx$ --- deployments need key
+transparency or another consistency mechanism, as in Privacy-Pass-style
+systems. And unlike the passive channels above, the deferred return is
+\emph{active}: an issuer can watermark a client by choosing a distinctive
+$t'$, which is exactly what the equal-balance restriction on challenge
+candidates excludes from the game --- return policies should be
+deterministic public functions of public data (say, of $s$ and the
+credential kind).
 
 \paragraph{Multi-instance hardening.}
-Every PRG and commitment call in the tree layer binds salt and position
-(after~\cite{OneTree}), preventing the known precomputation and
-batch-amortization attacks on the 128-bit seeds; a concrete multi-user bound
+Every PRG and commitment call in the tree layer binds the per-proof
+salt, the per-tree derived salt, and the exact tree position
+(after~\cite{OneTree}; Section~\ref{sec:voleith}), preventing the known
+multi-target and multi-instance amortization attacks on the 128-bit
+seeds; a concrete multi-user bound
 still carries adversary-instance-dependent terms. The wide consistency hash
 removes the $2^{-h}$ per-chunk cheating strategy. Domain tags separate every
-hash use; all encodings are canonical and rejected on any alternate
-serialization.
+hash use. Encodings are canonical within each requested typed decoder, which
+rejects alternate encodings of that typed value. Identical-layout bodies can
+be header-retagged into another local marker, however: wire tags are
+discriminants rather than authenticators, while proof statements, request
+digests, and semantic checks provide end-to-end binding.
 
 \section{Parameters and evaluation}
 \label{sec:performance}
@@ -1041,32 +1242,39 @@ The construction is implemented as a Rust research prototype (five crates:
 binary fields, GGM vector commitments, the VOLEitH proof system, MAYO, and
 the protocol). Table~\ref{tab:sizes} gives wire sizes; tokens are
 profile-independent and only proof-carrying requests grow with the
-low-latency profiles. On one Apple M4 Pro, a direct spend proves in
-19--20\,ms and verifies-and-signs in 6.5--8\,ms across profiles (issuance:
-8--9\,ms and 3--4\,ms; deferred-input spends roughly $1.4\times$ a direct
-spend). Figures are single-operation latencies on an idle machine. The
-compact profile's proving penalty over low-latency is $\approx$6--7\%
-while its proofs are $3.8\times$ smaller. Implementation techniques,
+low-latency profiles. On one Apple M4 Pro, the common spend relation proves
+in 29--31\,ms across profiles. Criterion measured Balanced-profile issuer
+verify-and-sign at 9.2--9.4\,ms for spends (issuance: 3.37\,ms); no
+cross-profile issuer range is inferred from that run. Direct and deferred
+inputs now differ only by zero constraints and have identical proof sizes.
+Figures are statistically sampled central estimates on an idle machine. The
+compact profile's proofs are $3.8\times$ smaller than low-latency.
+Implementation techniques,
 optimization methodology, and full per-profile measurements are documented
 in the repository,
 \url{https://github.com/SamuelSchlesinger/vole-act}
-(\texttt{docs/IMPLEMENTATION.md}, \texttt{docs/BENCHMARKS.md}; the
-measurements in this paper correspond to commit \texttt{65248c8}).
+(\texttt{docs/IMPLEMENTATION.md}, \texttt{docs/BENCHMARKS.md}; the latter
+includes the 2026-07-21 signer-salted experiment and a labeled pre-wrapper
+baseline).
 
 \begin{table}[h]
 \centering
-\caption{Wire sizes (bytes), MAYO$_2$, $\lambda = 128$.}
+\caption{Wire sizes (bytes), MAYO$_2$, $\lambda = 128$. Spend responses
+are uniformly framed --- the direct mode carries the deferred mode's
+return field structurally zero. Responses and tokens additionally carry a
+32-byte signer salt. The
+public-key row is the transmitted expanded MAYO map; the locally derived
+$G_a$ table of Section~\ref{sec:mayo} ($\approx$1.7\,MB) is never sent.}
 \label{tab:sizes}
 \begin{tabular}{lrrr}
 \toprule
 Object & compact & balanced & low-latency \\
 & $(\tau,h){=}(16,8)$ & $(32,4)$ & $(64,2)$ \\
 \midrule
-Token (either format) & 283 & 283 & 283 \\
+Token (either format) & 315 & 315 & 315 \\
 Issue request & 29\,750 & 55\,286 & 106\,358 \\
-Spend request (direct input) & 52\,990 & 101\,726 & 199\,198 \\
-Spend request (deferred input) & 72\,574 & 140\,894 & 277\,534 \\
-Issue / spend response & 171 / 179 & 171 / 179 & 171 / 179 \\
+Spend request (either input) & 73\,086 & 141\,918 & 279\,582 \\
+Issue / spend response & 203 / 211 & 203 / 211 & 203 / 211 \\
 Public key (expanded map) & 106\,319 & 106\,319 & 106\,319 \\
 \bottomrule
 \end{tabular}
@@ -1085,32 +1293,49 @@ oil-and-vinegar~\cite{UOV}; \cite{Beullens22} is the cautionary tale for the
 assumption class. The closest post-quantum
 relative is PoMFRIT~\cite{PoMFRIT}, a \emph{blind-signature} scheme that
 likewise combines VOLE-in-the-Head proofs of SHA-3-family circuits with the
-MAYO trapdoor and analyzes the one-more-preimage property such issuers
-require --- an instructive contrast: PoMFRIT pursues the blindness route
-with the same toolbox, while VOLE-ACT's commit-then-sign design avoids
+MAYO trapdoor. Its general construction proves the hash/signature relation
+and uses ordinary MAYO security; its optimized direct-target construction
+introduces the one-more-preimage assumption. This distinction motivates our
+signer-salted wrapper. PoMFRIT pursues the blindness route with the same
+toolbox, while VOLE-ACT's commit-then-sign design avoids
 blindness and adds stateful balances, typed settlement, and deferred
-returns. Anonymous tokens and credentials span
+returns. Two other post-quantum routes give contrast. Generic succinct
+proof systems yield credentials by proving possession of a conventionally
+signed credential (the zk-creds template~\cite{zkcreds}); instantiated
+with hash-based, STARK-style proofs the route is plausibly post-quantum
+and far more succinct than ours, but with a substantially heavier prover
+on exactly the hash statements VOLEitH proves natively, and with no
+analogue of the free $\Fsixteen \subseteq \Ftag$ treatment of the
+trapdoor equation. Structured lattices give practical anonymous
+credentials and round-optimal blind signatures~\cite{BLNS23,BLNSblind}
+with compact transcripts under algebraic lattice assumptions; against
+both routes, VOLE-ACT trades succinctness for a symmetric-heavy
+assumption base, a fast transparent prover, and exact balance arithmetic,
+at the price of 71\,KiB proofs and an online stateful issuer. Anonymous
+tokens and credentials span
 blind signatures~\cite{Chaum82}, CL signatures~\cite{CL01},
 keyed-verification credentials from algebraic MACs~\cite{CMZ14}, and
 deployed unit-token systems~\cite{PrivacyPass}; VOLE-ACT is a post-quantum
-stateful-balance member of this family, instantiating the
+candidate stateful-balance member of this family, instantiating the
 Katz--Schlesinger design~\cite{KS}.
 
 \section{Open problems}
+\label{sec:open}
 
 (1)~A complete security reduction: formalizing
 Definitions~\ref{def:fiscal}--\ref{def:anon} fully (concurrency, chains,
 adaptive corruptions) and proving Claims~\ref{claim:fiscal}
-and~\ref{claim:anon} in the QROM, including a precise formulation of
-Assumption~\ref{ass:omp} and its relation to MAYO's standard security.
+and~\ref{claim:anon} in the QROM, including the exact salted-wrapper
+adaptation of MAYO's OV/MTWMQ proof and its rejection-sampling loss.
 (2)~A structured, non-materialized QuickSilver check for the whipped MAYO
-equation, removing the $O(m (k_w n)^2)$ expanded-form table and enabling the
+equation, removing the $O(m (k_w n)^2)$ expanded-form table
+($\approx$1.7\,MB for MAYO$_2$; Section~\ref{sec:mayo}) and enabling the
 larger MAYO parameter sets (whose wider digests also raise the quantum
 collision ceiling).
 (3)~Hashing the compact public-key encoding (rather than the expanded forms)
 into the context --- a transcript-breaking cleanup best done before any
 format freeze.
-(4)~Aggregating or compressing spend proofs; at 52\,KiB the compact profile
+(4)~Aggregating or compressing spend proofs; at 71\,KiB the compact profile
 is deployable server-side but remains the dominant bandwidth cost.
 (5)~Hidden spend amounts, which would require in-circuit range checks and
 re-open the balance-width trade-off.
@@ -1202,6 +1427,12 @@ G.~Brassard, P.~H{\o}yer, A.~Tapp.
 \emph{Quantum Cryptanalysis of Hash and Claw-Free Functions}.
 LATIN 1998. arXiv:quant-ph/9705002.
 
+\bibitem{AaronsonShi}
+S.~Aaronson, Y.~Shi.
+\emph{Quantum Lower Bounds for the Collision and the Element Distinctness
+Problems}.
+Journal of the ACM 51(4), 2004.
+
 \bibitem{Chaum82}
 D.~Chaum.
 \emph{Blind Signatures for Untraceable Payments}.
@@ -1223,6 +1454,22 @@ A.~Davidson, I.~Goldberg, N.~Sullivan, G.~Tankersley, F.~Valsorda.
 \emph{Privacy Pass: Bypassing Internet Challenges Anonymously}.
 Proceedings on Privacy Enhancing Technologies 2018(3), 164--180.
 
+\bibitem{zkcreds}
+M.~Rosenberg, J.~White, C.~Garman, I.~Miers.
+\emph{zk-creds: Flexible Anonymous Credentials from zkSNARKs and Existing
+Identity Infrastructure}.
+IEEE S\&P 2023.
+
+\bibitem{BLNS23}
+J.~Bootle, V.~Lyubashevsky, N.~K.~Nguyen, A.~Sorniotti.
+\emph{A Framework for Practical Anonymous Credentials from Lattices}.
+CRYPTO 2023.
+
+\bibitem{BLNSblind}
+W.~Beullens, V.~Lyubashevsky, N.~K.~Nguyen, G.~Seiler.
+\emph{Lattice-Based Blind Signatures: Short, Efficient, and Round-Optimal}.
+ACM CCS 2023.
+
 \bibitem{PoMFRIT}
 C.~Baum, M.~Beckmann, W.~Beullens, S.~Mukherjee, C.~Rechberger.
 \emph{Concretely Efficient Blind Signatures Based on VOLE-in-the-Head
@@ -1232,8 +1479,10 @@ USENIX Security 2026. IACR ePrint 2026/109.
 \bibitem{KS}
 J.~Katz, S.~Schlesinger.
 \emph{Anonymous Credit Tokens}.
-Design document and Rust implementation,
-\url{https://github.com/SamuelSchlesinger/anonymous-credit-tokens}.
+IETF CFRG Internet-Draft draft-schlesinger-cfrg-act (work in progress),
+2025; design document and Rust implementation,
+\url{https://github.com/SamuelSchlesinger/anonymous-credit-tokens}
+(accessed July 2026).
 
 \end{thebibliography}
 

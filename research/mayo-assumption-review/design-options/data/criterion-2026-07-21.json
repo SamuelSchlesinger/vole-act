@@ -1,0 +1,61 @@
+{
+  "schema": "vole-act/criterion-export/v1",
+  "date": "2026-07-21",
+  "command": "cargo bench -p vole-act --bench protocol",
+  "git_base": "e7cec9fd658c443f2d02e06f98012b358fa2da5f",
+  "worktree": "signer-salted wire-v2 implementation under review",
+  "code_identity": {
+    "criterion_executable_sha256": "014499b57949c8354a700f7a35e051042584b30c381380483ae29869a771ee66",
+    "criterion_executable_local_path": "target/release/deps/protocol-476439f4015df207",
+    "current_benchmark_source_patch_sha256": "b753397eee63ae7dd4300f4360c5334eb198255e1ea1b661cddb38af03b4a6db",
+    "source_patch_fingerprint": "SHA-256 of `git diff --binary e7cec9fd658c443f2d02e06f98012b358fa2da5f --` over the root Cargo.toml/Cargo.lock, vole-act Cargo.toml/bench/non-test Rust sources, and changed voleith Cargo.toml/Rust sources, in the order recorded by docs/BENCHMARKS.md",
+    "note": "The executable hash identifies the exact measured binary. Later edits before this export was committed affected documentation, tests, and Rust comments, not benchmark-compiled behavior; the source-patch hash identifies the final reviewed implementation."
+  },
+  "host": {
+    "model": "MacBook Pro Mac16,8",
+    "chip": "Apple M4 Pro",
+    "cores": "14 (10 performance, 4 efficiency)",
+    "memory_gib": 48,
+    "os": "macOS 26.5.2 build 25F84",
+    "architecture": "aarch64-apple-darwin"
+  },
+  "toolchain": {
+    "rustc": "1.99.0-nightly (d0babd8b6 2026-07-15)",
+    "llvm": "22.1.8",
+    "criterion": "0.5.1"
+  },
+  "unit": "nanoseconds",
+  "estimate": "Criterion mean with 95% confidence interval",
+  "benchmarks": {
+    "profiles/issue_client-prove/compact": {"point_estimate": 10039899.71034483, "lower_bound": 9944769.965517242, "upper_bound": 10132257.462068966},
+    "profiles/issue_client-prove/balanced": {"point_estimate": 8593158.094285715, "lower_bound": 8511128.498142859, "upper_bound": 8679104.31392857},
+    "profiles/issue_client-prove/low-latency": {"point_estimate": 8610748.96111111, "lower_bound": 8518530.567083333, "upper_bound": 8720486.473541668},
+    "profiles/direct-input_client-prove/compact": {"point_estimate": 31168817.07, "lower_bound": 30772192.9245, "upper_bound": 31686557.172749996},
+    "profiles/direct-input_client-prove/balanced": {"point_estimate": 28955049.23636364, "lower_bound": 28408827.80068182, "upper_bound": 29633381.13022727},
+    "profiles/direct-input_client-prove/low-latency": {"point_estimate": 28991054.145454545, "lower_bound": 28744655.01068182, "upper_bound": 29235027.06840908},
+    "profiles/deferred-input_client-prove/compact": {"point_estimate": 31299283.35, "lower_bound": 31025304.303499997, "upper_bound": 31581020.440000005},
+    "profiles/deferred-input_client-prove/balanced": {"point_estimate": 28584236.745454542, "lower_bound": 28325413.71, "upper_bound": 28852988.574545454},
+    "profiles/deferred-input_client-prove/low-latency": {"point_estimate": 29420327.663636364, "lower_bound": 28718437.100227267, "upper_bound": 30466971.609090913},
+    "balanced/issue_issuer-verify-and-sign": {"point_estimate": 3366307.743529412, "lower_bound": 3313800.288823529, "upper_bound": 3434928.5764705883},
+    "balanced/direct-input_issuer-verify-and-sign": {"point_estimate": 9356341.166666666, "lower_bound": 9273599.804090908, "upper_bound": 9426837.184090909},
+    "balanced/deferred-input_issuer-verify-and-sign": {"point_estimate": 9223998.103030303, "lower_bound": 9165261.99090909, "upper_bound": 9276860.802878788},
+    "balanced/deferred-return_issuer-verify-and-sign": {"point_estimate": 9262468.31212121, "lower_bound": 9139651.31469697, "upper_bound": 9452334.851515152},
+    "balanced/direct_end-to-end": {"point_estimate": 40737011.95, "lower_bound": 40075824.4375, "upper_bound": 41479713.4034375},
+    "balanced/deferred-input_direct-end-to-end": {"point_estimate": 39254646.3625, "lower_bound": 38964193.2490625, "upper_bound": 39566856.275},
+    "balanced/deferred-return_end-to-end": {"point_estimate": 38995630.2, "lower_bound": 38719091.93, "upper_bound": 39256288.118125}
+  },
+  "stored_baseline_relative_change": {
+    "unit": "fraction",
+    "estimate": "Criterion mean with 95% confidence interval",
+    "benchmarks": {
+      "profiles/direct-input_client-prove/compact": {"point_estimate": 0.48942416431486424, "lower_bound": 0.4688064260404814, "upper_bound": 0.5126013485334746},
+      "profiles/direct-input_client-prove/balanced": {"point_estimate": 0.5309556349527245, "lower_bound": 0.502311466760549, "upper_bound": 0.5664387760519772},
+      "profiles/direct-input_client-prove/low-latency": {"point_estimate": 0.5206660192605941, "lower_bound": 0.5069063640354063, "upper_bound": 0.5347847781733616},
+      "balanced/direct-input_issuer-verify-and-sign": {"point_estimate": 0.4402273027203445, "lower_bound": 0.42653099174590076, "upper_bound": 0.45096419840127555},
+      "balanced/direct_end-to-end": {"point_estimate": 0.49371052010880234, "lower_bound": 0.467404913437648, "upper_bound": 0.514385353888627},
+      "profiles/deferred-input_client-prove/compact": {"point_estimate": -0.0376313344533622, "lower_bound": -0.045765470452870854, "upper_bound": -0.02838062950274556},
+      "profiles/deferred-input_client-prove/balanced": {"point_estimate": -0.057601696585688145, "lower_bound": -0.06598357997373487, "upper_bound": -0.04843709155986272},
+      "profiles/deferred-input_client-prove/low-latency": {"point_estimate": -0.04145639465857187, "lower_bound": -0.06461915578104896, "upper_bound": -0.008146779844778742}
+    }
+  }
+}

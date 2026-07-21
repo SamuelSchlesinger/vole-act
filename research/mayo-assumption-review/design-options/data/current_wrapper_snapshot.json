@@ -1,0 +1,21 @@
+{
+  "captured_at": "2026-07-21",
+  "provenance": "Timing summaries derive from criterion-2026-07-21.json; exact codec outputs were asserted by the all-profile release harness; historical payloads are the labeled pre-wrapper baseline in docs/BENCHMARKS.md",
+  "profiles": ["compact", "balanced", "low-latency"],
+  "old_direct_proof_bytes": [52688, 101232, 198320],
+  "old_deferred_proof_bytes": [72272, 140400, 276656],
+  "common_proof_bytes": [72784, 141424, 278704],
+  "current_spend_request_bytes": [73086, 141918, 279582],
+  "issue_prove_ms": [10.04, 8.59, 8.61],
+  "direct_prove_ms": [31.17, 28.96, 28.99],
+  "deferred_prove_ms": [31.30, 28.58, 29.42],
+  "balanced_issuer_spend_ms": [9.36, 9.22, 9.26],
+  "balanced_end_to_end_ms": [40.74, 39.25, 39.00],
+  "old_token_bytes": 283,
+  "current_token_bytes": 315,
+  "old_issue_response_bytes": 171,
+  "current_issue_response_bytes": 203,
+  "old_spend_response_bytes": 179,
+  "current_spend_response_bytes": 211,
+  "criterion_direct_prover_regression_percent": [49, 53]
+}

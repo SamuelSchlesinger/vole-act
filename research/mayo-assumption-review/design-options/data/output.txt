@@ -1,0 +1,13 @@
+compact: common proof=72784 bytes; vs old direct=38.14%; vs old deferred=0.71%
+balanced: common proof=141424 bytes; vs old direct=39.70%; vs old deferred=0.73%
+low-latency: common proof=278704 bytes; vs old direct=40.53%; vs old deferred=0.74%
+current proof range: 72784..278704 bytes
+current spend-request range: 73086..279582 bytes
+current issue-prove range: 8.59..10.04 ms
+current spend-prove range: 28.58..31.30 ms
+balanced issuer-spend range: 9.22..9.36 ms
+balanced spend end-to-end range: 39.00..40.74 ms
+balanced spend end-to-end means: 40.74,39.25,39.00 ms
+salt wire deltas: token=32, issue-response=32, spend-response=32 bytes
+Criterion stored-baseline direct-prover regression: 49..53%
+Criterion stored-baseline Balanced regressions: direct issuer=44%, direct end-to-end=49%
